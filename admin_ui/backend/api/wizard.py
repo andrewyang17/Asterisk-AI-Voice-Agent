@@ -1,5 +1,6 @@
 import docker
 import logging
+import copy
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 import httpx
@@ -21,7 +22,7 @@ import uuid
 import zipfile
 
 logger = logging.getLogger(__name__)
-from settings import ENV_PATH, CONFIG_PATH, ensure_env_file, PROJECT_ROOT
+from settings import ENV_PATH, CONFIG_PATH, LOCAL_CONFIG_PATH, ensure_env_file, PROJECT_ROOT
 from services.fs import upsert_env_vars, atomic_write_text
 from api.models_catalog import (
     get_full_catalog, get_models_by_language, get_available_languages,
@@ -33,6 +34,98 @@ router = APIRouter()
 
 DISK_WARNING_BYTES = 10 * 1024 * 1024 * 1024  # 10 GB
 DISK_BLOCK_BYTES = 2 * 1024 * 1024 * 1024  # 2 GB (hard stop for downloads)
+GOOGLE_LIVE_DEFAULT_MODEL = "gemini-2.5-flash-native-audio-latest"
+GOOGLE_MODELS_URL = "https://generativelanguage.googleapis.com/v1beta/models"
+GOOGLE_LIVE_PREFERRED_MODELS = [
+    GOOGLE_LIVE_DEFAULT_MODEL,
+    "gemini-2.5-flash-native-audio-preview-12-2025",
+    "gemini-2.5-flash-native-audio-preview-09-2025",
+    "gemini-live-2.5-flash-native-audio",
+    "gemini-live-2.5-flash-preview-native-audio-09-2025",
+    "gemini-live-2.5-flash-preview",
+]
+
+
+def _extract_google_live_models(models: List[Dict[str, Any]]) -> List[str]:
+    """Extract model names that support bidiGenerateContent (Gemini Live)."""
+    live_models: List[str] = []
+    for model in models:
+        methods = model.get("supportedGenerationMethods", [])
+        if "bidiGenerateContent" in methods:
+            model_name = model.get("name", "").replace("models/", "")
+            if model_name:
+                live_models.append(model_name)
+    return live_models
+
+
+def _select_google_live_model(live_models: List[str]) -> Optional[str]:
+    """Pick the best available Google Live model using preferred order."""
+    for preferred_model in GOOGLE_LIVE_PREFERRED_MODELS:
+        if preferred_model in live_models:
+            return preferred_model
+    if live_models:
+        return live_models[0]
+    return None
+
+
+async def _discover_google_live_model(api_key: str) -> Optional[str]:
+    """Discover an available Google Live model for the provided API key."""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                GOOGLE_MODELS_URL,
+                params={"key": api_key},
+                timeout=10.0,
+            )
+            if response.status_code != 200:
+                return None
+            data = response.json()
+            models = data.get("models", [])
+            live_models = _extract_google_live_models(models)
+            return _select_google_live_model(live_models)
+    except Exception:
+        return None
+
+
+def _parse_optional_bool(raw: Optional[str]) -> Optional[bool]:
+    """Parse common bool env values; return None when unset/unknown."""
+    if raw is None:
+        return None
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    return None
+
+
+def _detect_gpu_from_env_or_runtime() -> bool:
+    """
+    Detect GPU availability for admin recommendations and startup behavior.
+    Prefers GPU_AVAILABLE from .env (injected as container env), falls back to nvidia-smi.
+    """
+    gpu_env = _parse_optional_bool(os.environ.get("GPU_AVAILABLE"))
+    if gpu_env is not None:
+        return gpu_env
+
+    try:
+        nvidia_smi = shutil.which("nvidia-smi")
+        if not nvidia_smi:
+            return False
+        result = subprocess.run([nvidia_smi], capture_output=True, timeout=2)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _gpu_override_enabled_from_preflight() -> bool:
+    """
+    Enable GPU compose override only when preflight has explicitly set GPU_AVAILABLE.
+    This avoids breaking CPU fallback on hosts where nvidia-smi exists but Docker GPU
+    passthrough is not configured yet.
+    """
+    gpu_env = _parse_optional_bool(os.environ.get("GPU_AVAILABLE"))
+    return gpu_env is True
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -72,6 +165,36 @@ def _disk_preflight(path: str, *, required_bytes: int = 0) -> Tuple[bool, Option
     if free < DISK_WARNING_BYTES:
         return True, f"Low disk space: only {_format_bytes(free)} free (path={path})."
     return True, None
+
+
+def _compute_local_override_fallback(base: Any, merged: Any) -> Any:
+    """
+    Compute a minimal override tree using simple deep-diff semantics.
+
+    `None` in the merged tree acts as a tombstone and is preserved as-is.
+    """
+    if isinstance(base, dict) and isinstance(merged, dict):
+        out: Dict[str, Any] = {}
+
+        for key, merged_val in merged.items():
+            if key not in base:
+                out[key] = merged_val
+                continue
+            child = _compute_local_override_fallback(base[key], merged_val)
+            if child is not _NO_OVERRIDE:
+                out[key] = child
+
+        for key in base.keys() - merged.keys():
+            out[key] = None
+
+        return out
+
+    if base == merged:
+        return _NO_OVERRIDE
+    return merged
+
+
+_NO_OVERRIDE = object()
 
 
 def _detect_host_project_path_via_docker() -> Optional[str]:
@@ -602,6 +725,15 @@ async def load_existing_config():
             "google_key": env_values.get("GOOGLE_API_KEY", ""),
             "elevenlabs_key": env_values.get("ELEVENLABS_API_KEY", ""),
             "elevenlabs_agent_id": env_values.get("ELEVENLABS_AGENT_ID", ""),
+            "local_stt_backend": env_values.get("LOCAL_STT_BACKEND", "vosk"),
+            "local_tts_backend": env_values.get("LOCAL_TTS_BACKEND", "piper"),
+            "kroko_embedded": _parse_optional_bool(env_values.get("KROKO_EMBEDDED")) is True,
+            "kroko_api_key": env_values.get("KROKO_API_KEY", ""),
+            "kokoro_mode": (env_values.get("KOKORO_MODE", "local") or "local").strip().lower(),
+            "kokoro_voice": env_values.get("KOKORO_VOICE", "af_heart"),
+            "kokoro_api_base_url": env_values.get("KOKORO_API_BASE_URL", ""),
+            "kokoro_api_key": env_values.get("KOKORO_API_KEY", ""),
+            "local_llm_model": "",
         }
     
     # Load AI config from YAML if it exists
@@ -635,9 +767,13 @@ async def load_existing_config():
             if greeting:
                 config["greeting"] = greeting
             
-            # Try to detect provider from config
-            if default_ctx.get("provider"):
+            active_pipeline = (yaml_config.get("active_pipeline") or "").strip()
+            if active_pipeline == "local_hybrid" or active_pipeline.startswith("local_hybrid_"):
+                config["provider"] = "local_hybrid"
+            elif default_ctx.get("provider"):
                 config["provider"] = default_ctx.get("provider")
+            elif yaml_config.get("default_provider"):
+                config["provider"] = yaml_config.get("default_provider")
         except:
             pass
     
@@ -908,21 +1044,7 @@ async def get_available_models(language: Optional[str] = None):
     ram_gb = psutil.virtual_memory().total // (1024**3)
     cpu_cores = psutil.cpu_count() or 1
 
-    # GPU detection: prefer GPU_AVAILABLE from .env (set by preflight.sh), fallback to nvidia-smi
-    # AAVA-140: preflight.sh detects GPU on host and writes to .env
-    gpu_detected = False
-    gpu_env = os.environ.get("GPU_AVAILABLE", "").lower()
-    if gpu_env == "true":
-        gpu_detected = True
-    elif gpu_env == "false":
-        gpu_detected = False
-    else:
-        # Fallback: try nvidia-smi in container (works if GPU passthrough enabled)
-        try:
-            result = subprocess.run(["nvidia-smi"], capture_output=True, timeout=2)
-            gpu_detected = result.returncode == 0
-        except Exception:
-            gpu_detected = False
+    gpu_detected = _detect_gpu_from_env_or_runtime()
     
     # Get the full catalog or filtered by language
     if language:
@@ -997,22 +1119,7 @@ async def detect_local_tier():
         cpu_count = psutil.cpu_count()
         ram_gb = psutil.virtual_memory().total // (1024**3)
         
-        # GPU detection: prefer GPU_AVAILABLE from .env (set by preflight.sh)
-        # AAVA-140: preflight.sh detects GPU on host and writes to .env
-        gpu_detected = False
-        gpu_env = os.environ.get("GPU_AVAILABLE", "").lower()
-        if gpu_env == "true":
-            gpu_detected = True
-        elif gpu_env == "false":
-            gpu_detected = False
-        else:
-            # Fallback: try nvidia-smi in container (works if GPU passthrough enabled)
-            try:
-                result = subprocess.run(["nvidia-smi"], capture_output=True, timeout=5)
-                if result.returncode == 0:
-                    gpu_detected = True
-            except:
-                pass
+        gpu_detected = _detect_gpu_from_env_or_runtime()
         
         # Determine tier
         if gpu_detected:
@@ -1393,7 +1500,9 @@ class ModelSelection(BaseModel):
     tts: str  # backend name (e.g., "piper")
     language: Optional[str] = "en-US"
     kroko_embedded: Optional[bool] = False
+    kroko_api_key: Optional[str] = None
     kokoro_mode: Optional[str] = "local"
+    kokoro_voice: Optional[str] = "af_heart"
     kokoro_api_base_url: Optional[str] = None
     kokoro_api_key: Optional[str] = None
     # Local Hybrid support: download/apply only STT/TTS (skip LLM model download/config)
@@ -1757,24 +1866,38 @@ async def download_selected_models(selection: ModelSelection):
             if (stt_model.get("backend") or selection.stt) == "kroko":
                 env_updates.append(f"KROKO_EMBEDDED={'1' if selection.kroko_embedded else '0'}")
                 env_updates.append(f"KROKO_LANGUAGE={selection.language or 'en-US'}")
+                if not selection.kroko_embedded and selection.kroko_api_key:
+                    env_updates.append(f"KROKO_API_KEY={selection.kroko_api_key}")
             
             # Set model paths
-            if stt_model.get("model_path") and stt_model.get("download_url"):
-                stt_path = os.path.join("/app/models/stt", stt_model["model_path"])
-                if stt_model.get("backend") == "sherpa":
+            if stt_model.get("model_path"):
+                stt_backend = (stt_model.get("backend") or selection.stt or "").lower()
+                if stt_backend == "sherpa":
+                    stt_path = os.path.join("/app/models/stt", stt_model["model_path"])
                     env_updates.append(f"SHERPA_MODEL_PATH={stt_path}")
+                elif stt_backend == "kroko":
+                    if selection.kroko_embedded:
+                        stt_path = os.path.join("/app/models/kroko", stt_model["model_path"])
+                        env_updates.append(f"KROKO_MODEL_PATH={stt_path}")
+                elif stt_backend == "faster_whisper":
+                    env_updates.append(f"FASTER_WHISPER_MODEL={stt_model['model_path']}")
                 else:
+                    stt_path = os.path.join("/app/models/stt", stt_model["model_path"])
                     env_updates.append(f"LOCAL_STT_MODEL_PATH={stt_path}")
             
             if not skip_llm_download and llm_model and llm_model.get("model_path") and llm_model.get("download_url"):
                 llm_path = os.path.join("/app/models/llm", llm_model["model_path"])
                 env_updates.append(f"LOCAL_LLM_MODEL_PATH={llm_path}")
             
-            if tts_model.get("model_path") and tts_model.get("download_url"):
-                tts_path = os.path.join("/app/models/tts", tts_model["model_path"])
-                if tts_model.get("backend") == "kokoro":
+            if tts_model.get("model_path"):
+                tts_backend = (tts_model.get("backend") or selection.tts or "").lower()
+                if tts_backend == "kokoro":
+                    tts_path = os.path.join("/app/models/tts", tts_model["model_path"])
                     env_updates.append(f"KOKORO_MODEL_PATH={tts_path}")
-                else:
+                elif tts_backend == "melotts":
+                    env_updates.append(f"MELOTTS_VOICE={tts_model['model_path']}")
+                elif tts_model.get("download_url"):
+                    tts_path = os.path.join("/app/models/tts", tts_model["model_path"])
                     env_updates.append(f"LOCAL_TTS_MODEL_PATH={tts_path}")
 
             # Kokoro mode: local vs api/hf (no local files required)
@@ -1783,7 +1906,7 @@ async def download_selected_models(selection: ModelSelection):
                 if mode not in ("local", "api", "hf"):
                     mode = "local"
                 env_updates.append(f"KOKORO_MODE={mode}")
-                env_updates.append("KOKORO_VOICE=af_heart")
+                env_updates.append(f"KOKORO_VOICE={selection.kokoro_voice or 'af_heart'}")
                 if mode == "api":
                     if selection.kokoro_api_base_url:
                         env_updates.append(f"KOKORO_API_BASE_URL={selection.kokoro_api_base_url}")
@@ -1888,7 +2011,7 @@ async def check_models_status():
     kroko_dir = os.path.join(models_dir, "kroko")
     if os.path.exists(kroko_dir):
         for item in os.listdir(kroko_dir):
-            if item.endswith(".onnx"):
+            if item.endswith(".onnx") or item.endswith(".data"):
                 stt_backends["kroko"].append(item)
     
     # Scan LLM models
@@ -1966,13 +2089,14 @@ async def start_local_ai_server():
     print(f"DEBUG: Media setup result: {media_setup}")
     
     try:
-        # AAVA-140: Check if GPU is available (set by preflight.sh)
-        gpu_available = os.environ.get("GPU_AVAILABLE", "").lower() == "true"
+        # Use preflight-derived flag to decide compose override.
+        # Do not infer from runtime nvidia-smi here because passthrough may be unavailable.
+        gpu_available = _gpu_override_enabled_from_preflight()
 
         # Build docker compose command - use GPU override file if GPU detected
         cmd_base = ["docker", "compose", "-p", "asterisk-ai-voice-agent"]
         if gpu_available:
-            print("DEBUG: GPU detected (GPU_AVAILABLE=true), using docker-compose.gpu.yml")
+            print("DEBUG: GPU override enabled (GPU_AVAILABLE=true), using docker-compose.gpu.yml")
             cmd_base += ["-f", "docker-compose.yml", "-f", "docker-compose.gpu.yml"]
 
         # Fast path: start from existing image (avoid triggering a rebuild on every click)
@@ -2044,10 +2168,12 @@ async def start_local_ai_server():
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
+            logf.close()
 
             return {
                 "success": True,
-                "message": f"Local AI Server build/start initiated in background; this can take several minutes. See {log_path} or container logs once created.",
+                "building": True,
+                "message": f"Local AI Server image is being built in the background (this can take 10-60 minutes for GPU builds). See {log_path} or container logs once created.",
                 "media_setup": media_setup,
             }
 
@@ -2332,21 +2458,17 @@ async def validate_api_key(validation: ApiKeyValidation):
                     
             elif provider == "google":
                 response = await client.get(
-                    f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}",
+                    GOOGLE_MODELS_URL,
+                    params={"key": api_key},
                     timeout=10.0
                 )
                 if response.status_code == 200:
                     # Check if the required model with bidiGenerateContent is available
                     data = response.json()
                     models = data.get("models", [])
-                    
+
                     # Find models that support bidiGenerateContent (required for Live API)
-                    live_models = []
-                    for model in models:
-                        methods = model.get("supportedGenerationMethods", [])
-                        if "bidiGenerateContent" in methods:
-                            model_name = model.get("name", "").replace("models/", "")
-                            live_models.append(model_name)
+                    live_models = _extract_google_live_models(models)
                     
                     if not live_models:
                         return {
@@ -2354,24 +2476,20 @@ async def validate_api_key(validation: ApiKeyValidation):
                             "error": "API key valid but no Live API models available. Your API key doesn't have access to Gemini Live models (bidiGenerateContent). Try creating a new key at aistudio.google.com"
                         }
                     
-                    # Check if our preferred models are available (in order of preference)
-                    preferred_models = [
-                        "gemini-2.5-flash-native-audio-preview-12-2025",  # Latest native audio model
-                        "gemini-2.0-flash-live-001",  # Stable live model
-                        "gemini-2.0-flash-exp",  # Experimental
-                    ]
-                    
-                    for preferred_model in preferred_models:
-                        if preferred_model in live_models:
-                            return {
-                                "valid": True, 
-                                "message": f"Google API key is valid. Live model '{preferred_model}' is available."
-                            }
-                    
-                    # No preferred model found, but we have some live models
+                    selected_model = _select_google_live_model(live_models)
+                    if selected_model:
+                        return {
+                            "valid": True,
+                            "message": f"Google API key is valid. Live model '{selected_model}' is available.",
+                            "selected_model": selected_model,
+                            "available_models": live_models,
+                        }
+
+                    # Defensive fallback (should not happen if live_models is non-empty)
                     return {
-                        "valid": True, 
-                        "message": f"Google API key is valid. Available Live models: {', '.join(live_models[:3])}"
+                        "valid": True,
+                        "message": f"Google API key is valid. Available Live models: {', '.join(live_models[:3])}",
+                        "available_models": live_models,
                     }
                 elif response.status_code in [400, 403]:
                     return {"valid": False, "error": "Invalid API key"}
@@ -2539,6 +2657,19 @@ class SetupConfig(BaseModel):
     ai_name: str
     ai_role: str
     hybrid_llm_provider: Optional[str] = None
+    local_stt_backend: Optional[str] = None
+    local_stt_model: Optional[str] = None
+    kroko_embedded: Optional[bool] = False
+    kroko_api_key: Optional[str] = None
+    local_tts_backend: Optional[str] = None
+    local_tts_model: Optional[str] = None
+    kokoro_mode: Optional[str] = "local"
+    kokoro_voice: Optional[str] = "af_heart"
+    kokoro_api_key: Optional[str] = None
+    kokoro_api_base_url: Optional[str] = None
+    local_llm_model: Optional[str] = None
+    local_llm_custom_url: Optional[str] = None
+    local_llm_custom_filename: Optional[str] = None
 
 # ... (keep existing endpoints) ...
 
@@ -2609,15 +2740,89 @@ async def save_setup_config(config: SetupConfig):
         if config.cartesia_key:
             env_updates["CARTESIA_API_KEY"] = config.cartesia_key
 
+        if config.provider in ("local", "local_hybrid"):
+            catalog = get_full_catalog()
+            stt_by_id = {m.get("id"): m for m in catalog.get("stt", []) if m.get("id")}
+            tts_by_id = {m.get("id"): m for m in catalog.get("tts", []) if m.get("id")}
+            llm_by_id = {m.get("id"): m for m in catalog.get("llm", []) if m.get("id")}
+
+            stt_model = stt_by_id.get(config.local_stt_model or "")
+            tts_model = tts_by_id.get(config.local_tts_model or "")
+            llm_model = llm_by_id.get(config.local_llm_model or "")
+
+            stt_backend = (config.local_stt_backend or (stt_model or {}).get("backend") or "").strip().lower()
+            tts_backend = (config.local_tts_backend or (tts_model or {}).get("backend") or "").strip().lower()
+
+            if stt_backend:
+                env_updates["LOCAL_STT_BACKEND"] = stt_backend
+            if tts_backend:
+                env_updates["LOCAL_TTS_BACKEND"] = tts_backend
+            env_updates["LOCAL_AI_MODE"] = "minimal" if config.provider == "local_hybrid" else "full"
+
+            stt_model_path = (stt_model or {}).get("model_path")
+            if stt_backend == "sherpa" and stt_model_path:
+                env_updates["SHERPA_MODEL_PATH"] = os.path.join("/app/models/stt", stt_model_path)
+            elif stt_backend == "kroko":
+                env_updates["KROKO_EMBEDDED"] = "1" if config.kroko_embedded else "0"
+                if config.kroko_api_key:
+                    env_updates["KROKO_API_KEY"] = config.kroko_api_key
+                if config.kroko_embedded and stt_model_path:
+                    env_updates["KROKO_MODEL_PATH"] = os.path.join("/app/models/kroko", stt_model_path)
+            elif stt_backend == "faster_whisper" and stt_model_path:
+                env_updates["FASTER_WHISPER_MODEL"] = stt_model_path
+            elif stt_model_path:
+                env_updates["LOCAL_STT_MODEL_PATH"] = os.path.join("/app/models/stt", stt_model_path)
+
+            tts_model_path = (tts_model or {}).get("model_path")
+            if tts_backend == "kokoro":
+                mode = (config.kokoro_mode or "local").strip().lower()
+                if mode not in ("local", "api", "hf"):
+                    mode = "local"
+                env_updates["KOKORO_MODE"] = mode
+                env_updates["KOKORO_VOICE"] = (config.kokoro_voice or "af_heart").strip()
+                if tts_model_path:
+                    env_updates["KOKORO_MODEL_PATH"] = os.path.join("/app/models/tts", tts_model_path)
+                if mode == "api":
+                    if config.kokoro_api_base_url:
+                        env_updates["KOKORO_API_BASE_URL"] = config.kokoro_api_base_url
+                    if config.kokoro_api_key:
+                        env_updates["KOKORO_API_KEY"] = config.kokoro_api_key
+            elif tts_backend == "melotts":
+                if tts_model_path:
+                    env_updates["MELOTTS_VOICE"] = tts_model_path
+            elif tts_model_path:
+                env_updates["LOCAL_TTS_MODEL_PATH"] = os.path.join("/app/models/tts", tts_model_path)
+
+            if config.provider == "local":
+                if config.local_llm_model == "custom_gguf_url":
+                    custom_name = (config.local_llm_custom_filename or "").strip()
+                    if custom_name:
+                        env_updates["LOCAL_LLM_MODEL_PATH"] = os.path.join("/app/models/llm", custom_name)
+                elif llm_model and llm_model.get("model_path"):
+                    env_updates["LOCAL_LLM_MODEL_PATH"] = os.path.join("/app/models/llm", llm_model["model_path"])
+
         upsert_env_vars(ENV_PATH, env_updates, header="Setup Wizard")
 
         # 2. Update ai-agent.yaml - APPEND MODE
         # If provider already exists, just enable it and update greeting
         # If provider doesn't exist, create full config
         # Don't auto-disable other providers (user manages via Dashboard)
-        if os.path.exists(CONFIG_PATH):
+        # Read merged config (base + local override) so wizard sees operator changes.
+        compute_local_override_fn = None
+        try:
+            from api.config import _read_merged_config_dict, _read_base_config_dict, _compute_local_override
+            yaml_config = _read_merged_config_dict()
+            base_config = _read_base_config_dict()
+            compute_local_override_fn = _compute_local_override
+        except Exception as exc:
+            logger.warning("Wizard config helper import failed; using fallback override diff: %s", exc)
+            yaml_config = None
+            base_config = None
+        if not yaml_config and os.path.exists(CONFIG_PATH):
             with open(CONFIG_PATH, "r") as f:
                 yaml_config = yaml.safe_load(f)
+        if yaml_config is not None:
+            pre_edit_config = copy.deepcopy(yaml_config) if isinstance(yaml_config, dict) else {}
             
             yaml_config.setdefault("providers", {})
             providers = yaml_config["providers"]
@@ -2625,6 +2830,18 @@ async def save_setup_config(config: SetupConfig):
             # Helper to check if provider already exists with config
             def provider_exists(name: str) -> bool:
                 return name in providers and len(providers[name]) > 1  # More than just 'enabled'
+
+            selected_google_live_model = GOOGLE_LIVE_DEFAULT_MODEL
+            if config.provider == "google_live" and config.google_key:
+                discovered_model = await _discover_google_live_model(config.google_key)
+                if discovered_model:
+                    selected_google_live_model = discovered_model
+                    logger.info("Resolved Google Live model for setup: %s", selected_google_live_model)
+                else:
+                    logger.warning(
+                        "Could not resolve Google Live model during setup; falling back to default: %s",
+                        selected_google_live_model,
+                    )
             
             # Full agent providers - clear active_pipeline when setting as default
             if config.provider in ["openai_realtime", "deepgram", "google_live", "elevenlabs_agent", "local"]:
@@ -2636,6 +2853,7 @@ async def save_setup_config(config: SetupConfig):
                 # Only set full config if provider doesn't exist yet
                 if not provider_exists("openai_realtime"):
                     providers["openai_realtime"].update({
+                        "api_version": "beta",
                         "model": "gpt-4o-realtime-preview-2024-12-17",
                         "voice": "alloy",
                         "input_encoding": "ulaw",
@@ -2673,7 +2891,7 @@ async def save_setup_config(config: SetupConfig):
                 if not provider_exists("google_live"):
                     providers["google_live"].update({
                         "api_key": "${GOOGLE_API_KEY}",
-                        "llm_model": "gemini-2.0-flash-exp",
+                        "llm_model": selected_google_live_model,
                         "input_encoding": "ulaw",
                         "input_sample_rate_hz": 8000,
                         "provider_input_encoding": "linear16",
@@ -2684,6 +2902,7 @@ async def save_setup_config(config: SetupConfig):
                         "type": "full",
                         "capabilities": ["stt", "llm", "tts"]
                     })
+                providers["google_live"]["llm_model"] = selected_google_live_model
                 providers["google_live"]["greeting"] = config.greeting
                 providers["google_live"]["instructions"] = f"You are {config.ai_name}, a {config.ai_role}. Be helpful and concise."
 
@@ -2717,8 +2936,14 @@ async def save_setup_config(config: SetupConfig):
 
             elif config.provider == "local_hybrid":
                 # local_hybrid is a PIPELINE (Local STT + Cloud/Local LLM + Local TTS)
-                yaml_config["active_pipeline"] = "local_hybrid"
-                yaml_config["default_provider"] = "local"  # Fallback provider
+                # AAVA-185: Use variant-specific pipeline name so the dashboard
+                # correctly highlights the active pipeline (e.g. local_hybrid_groq).
+                llm_provider = (config.hybrid_llm_provider or "groq").lower()
+                pipeline_name = "local_hybrid_groq" if llm_provider == "groq" else (
+                    "local_hybrid_ollama" if llm_provider == "ollama" else "local_hybrid"
+                )
+                yaml_config["active_pipeline"] = pipeline_name
+                yaml_config["default_provider"] = pipeline_name  # Fallback provider
                 
                 # Configure local provider
                 providers.setdefault("local", {})["enabled"] = True
@@ -2744,7 +2969,6 @@ async def save_setup_config(config: SetupConfig):
                 if not provider_exists("local_tts"):
                     providers["local_tts"]["ws_url"] = "${LOCAL_WS_URL:-ws://127.0.0.1:8765}"
                 
-                llm_provider = (config.hybrid_llm_provider or "groq").lower()
                 if llm_provider == "openai":
                     providers.setdefault("openai_llm", {})["enabled"] = True
                     if not provider_exists("openai_llm"):
@@ -2780,26 +3004,29 @@ async def save_setup_config(config: SetupConfig):
                             "capabilities": ["llm"],
                         })
                 
-                # Define the pipeline
+                # Define the pipeline with variant-specific name (AAVA-185)
                 llm_component = "openai_llm"
                 if llm_provider == "groq":
                     llm_component = "groq_llm"
                 elif llm_provider == "ollama":
                     llm_component = "ollama_llm"
 
-                yaml_config.setdefault("pipelines", {})["local_hybrid"] = {
+                yaml_config.setdefault("pipelines", {})[pipeline_name] = {
                     "stt": "local_stt",
                     "llm": llm_component,
                     "tts": "local_tts"
                 }
 
             # C6 Fix: Create default context
-            yaml_config.setdefault("contexts", {})["default"] = {
+            default_context = {
                 "greeting": config.greeting,
                 "prompt": f"You are {config.ai_name}, a {config.ai_role}. Be helpful and concise.",
                 "provider": config.provider if config.provider != "local_hybrid" else "local",
                 "profile": "telephony_ulaw_8k"
             }
+            if config.provider == "local_hybrid":
+                default_context["pipeline"] = pipeline_name
+            yaml_config.setdefault("contexts", {})["default"] = default_context
 
             # Canonical: ARI application name is YAML-owned (asterisk.app_name).
             asterisk_block = yaml_config.get("asterisk")
@@ -2811,9 +3038,35 @@ async def save_setup_config(config: SetupConfig):
             if config.asterisk_server_ip:
                 yaml_config.setdefault("external_media", {})["allowed_remote_hosts"] = [config.asterisk_server_ip]
 
+            local_override = None
+            if compute_local_override_fn and isinstance(base_config, dict):
+                try:
+                    local_override = compute_local_override_fn(base_config, yaml_config)
+                except Exception as exc:
+                    logger.warning(
+                        "Wizard override diff failed for %s (base_config_present=%s): %s",
+                        LOCAL_CONFIG_PATH,
+                        isinstance(base_config, dict),
+                        exc,
+                    )
+
+            if not isinstance(local_override, dict):
+                fallback_base = pre_edit_config if isinstance(pre_edit_config, dict) else {}
+                try:
+                    fallback_override = _compute_local_override_fallback(fallback_base, yaml_config)
+                    local_override = fallback_override if isinstance(fallback_override, dict) else {}
+                except Exception as exc:
+                    logger.warning(
+                        "Wizard fallback override diff failed for %s (base_config_present=%s): %s",
+                        LOCAL_CONFIG_PATH,
+                        isinstance(base_config, dict),
+                        exc,
+                    )
+                    local_override = {}
+
             atomic_write_text(
-                CONFIG_PATH,
-                yaml.dump(yaml_config, default_flow_style=False, sort_keys=False),
+                LOCAL_CONFIG_PATH,
+                yaml.dump(local_override, default_flow_style=False, sort_keys=False),
                 mode_from_existing=True,
             )
         

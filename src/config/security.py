@@ -158,6 +158,7 @@ def inject_provider_api_keys(config_data: Dict[str, Any]) -> None:
     - GROQ_API_KEY: Groq provider API key (Groq Speech + Groq OpenAI-compatible LLM)
     - DEEPGRAM_API_KEY: Deepgram provider API key
     - GOOGLE_API_KEY: Google provider API key
+    - TELNYX_API_KEY: Telnyx AI Inference API key (OpenAI-compatible LLM)
     
     Args:
         config_data: Configuration dictionary to modify in-place
@@ -201,6 +202,18 @@ def inject_provider_api_keys(config_data: Dict[str, Any]) -> None:
                 if name_lower.startswith("groq") or cfg_type == "groq" or chat_host == "api.groq.com":
                     provider_cfg["api_key"] = groq_key
                     providers_block[provider_name] = provider_cfg
+
+        # Inject TELNYX_API_KEY for any telnyx* provider blocks (telnyx_llm, etc.)
+        telnyx_key = os.getenv("TELNYX_API_KEY")
+        if telnyx_key:
+            for provider_name, provider_cfg in list(providers_block.items()):
+                if not isinstance(provider_cfg, dict):
+                    continue
+                name_lower = str(provider_name).lower()
+                chat_host = _url_host(provider_cfg.get("chat_base_url", "") or provider_cfg.get("base_url", ""))
+                if name_lower.startswith(("telnyx", "telenyx")) or chat_host == "api.telnyx.com":
+                    provider_cfg["api_key"] = telnyx_key
+                    providers_block[provider_name] = provider_cfg
         
         # Inject DEEPGRAM_API_KEY
         deepgram_block = providers_block.get('deepgram', {}) or {}
@@ -212,8 +225,30 @@ def inject_provider_api_keys(config_data: Dict[str, Any]) -> None:
         google_live_block = providers_block.get('google_live', {}) or {}
         if isinstance(google_live_block, dict):
             google_live_block['api_key'] = os.getenv('GOOGLE_API_KEY')
+            # Inject Vertex AI project/location when set (AAVA-191)
+            gcp_project = os.getenv('GOOGLE_CLOUD_PROJECT')
+            gcp_location = os.getenv('GOOGLE_CLOUD_LOCATION')
+            if gcp_project:
+                google_live_block.setdefault('vertex_project', gcp_project)
+            if gcp_location:
+                google_live_block.setdefault('vertex_location', gcp_location)
             providers_block['google_live'] = google_live_block
         
+        # Auto-set GOOGLE_APPLICATION_CREDENTIALS for Vertex AI ADC.
+        # Case 1: env var not set at all → set it if the default file exists.
+        # Case 2: env var set but points to a missing file → override with the
+        #         default mount path so ADC doesn't blow up at call time.
+        # Case 3: env var set, file missing, AND no default fallback → unset the
+        #         var so google.auth.default() doesn't crash on a stale path.
+        default_creds_path = "/app/project/secrets/gcp-service-account.json"
+        current_creds = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+        if not current_creds or not os.path.isfile(current_creds):
+            if os.path.isfile(default_creds_path):
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = default_creds_path
+            elif current_creds:
+                # Stale pointer — remove so ADC falls back to API-key mode
+                os.environ.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
+
         config_data['providers'] = providers_block
     except Exception:
         # Non-fatal; Pydantic may still raise if keys are missing

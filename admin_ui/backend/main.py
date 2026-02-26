@@ -72,10 +72,62 @@ if _is_remote_bind and _raw_jwt_secret in _placeholder_secrets:
         _uvicorn_host,
     )
 
-from api import config, system, wizard, logs, local_ai, ollama, mcp, calls, outbound, tools  # noqa: E402
+from api import config, system, wizard, logs, local_ai, ollama, mcp, calls, outbound, tools, docs  # noqa: E402
 import auth  # noqa: E402
 
-app = FastAPI(title="Asterisk AI Voice Agent Admin API")
+# Allow disabling API docs in production for security hardening
+_enable_api_docs = os.getenv("ENABLE_API_DOCS", "true").lower() in ("1", "true", "yes")
+
+app = FastAPI(
+    title="Asterisk AI Voice Agent Admin API",
+    description="""
+REST API for managing the Asterisk AI Voice Agent system.
+
+## Authentication
+Most endpoints require JWT authentication. Obtain a token via `POST /api/auth/login`.
+
+## API Groups
+
+| Group | Description |
+|-------|-------------|
+| **auth** | Login, password management, user info |
+| **config** | YAML configuration, environment variables, provider settings |
+| **system** | Container management, health checks, updates, ARI testing |
+| **wizard** | Setup wizard, local AI model management |
+| **local-ai** | Local AI server model switching, backends, capabilities |
+| **calls** | Call history, transcripts, statistics, export |
+| **outbound** | Campaign management, leads, recordings |
+| **tools** | Tool catalog, HTTP tool testing, email templates |
+| **logs** | Container logs and structured log events |
+| **mcp** | MCP server status and testing (proxied from AI Engine) |
+| **ollama** | Ollama connection testing and model listing |
+| **documentation** | In-app documentation browser |
+
+## Related Services
+
+| Service | Endpoints |
+|---------|-----------|
+| **AI Engine Health Server** (port 15000) | `/health`, `/metrics`, `/live`, `/ready`, `/reload` |
+""",
+    version="6.2.0",
+    docs_url="/docs" if _enable_api_docs else None,
+    redoc_url="/redoc" if _enable_api_docs else None,
+    openapi_url="/openapi.json" if _enable_api_docs else None,
+    openapi_tags=[
+        {"name": "auth", "description": "Authentication and user management"},
+        {"name": "config", "description": "Configuration management (YAML, .env, providers)"},
+        {"name": "system", "description": "System operations, containers, updates, health"},
+        {"name": "wizard", "description": "Setup wizard and local AI model downloads"},
+        {"name": "local-ai", "description": "Local AI server management"},
+        {"name": "calls", "description": "Call history and analytics"},
+        {"name": "outbound", "description": "Outbound campaigns and lead management"},
+        {"name": "tools", "description": "Tool catalog and HTTP tool testing"},
+        {"name": "logs", "description": "Container logs and events"},
+        {"name": "mcp", "description": "MCP server status (proxied from AI Engine)"},
+        {"name": "ollama", "description": "Ollama integration testing"},
+        {"name": "documentation", "description": "In-app documentation browser"},
+    ],
+)
 
 # Initialize users (create default admin if needed)
 auth.load_users()
@@ -125,6 +177,7 @@ app.include_router(ollama.router, tags=["ollama"], dependencies=[Depends(auth.ge
 app.include_router(calls.router, prefix="/api", tags=["calls"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(outbound.router, prefix="/api", tags=["outbound"], dependencies=[Depends(auth.get_current_user)])
 app.include_router(tools.router, prefix="/api/tools", tags=["tools"], dependencies=[Depends(auth.get_current_user)])
+app.include_router(docs.router, tags=["documentation"], dependencies=[Depends(auth.get_current_user)])
 
 @app.get("/health")
 async def health_check():
@@ -143,7 +196,7 @@ if os.path.exists(static_dir):
     @app.get("/{full_path:path}")
     async def serve_react_app(full_path: str):
         # API routes are already handled above
-        if full_path.startswith("api/"):
+        if full_path.startswith("api/") or full_path in ("docs", "redoc", "openapi.json"):
             raise HTTPException(status_code=404, detail="Not found")
             
         # Serve index.html for all other routes (SPA)

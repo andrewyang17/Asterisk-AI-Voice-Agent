@@ -32,6 +32,7 @@ FAILURES=()
 FIX_CMDS=()          # Commands that --apply-fixes will run
 MANUAL_CMDS=()       # Commands user must run manually (e.g., reboot/logout)
 APPLY_FIXES=false
+FORCE_MODE=false
 DOCKER_ROOTLESS=false
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -285,6 +286,7 @@ PERSIST_MEDIA_MOUNT=false
 for arg in "$@"; do
     case $arg in
         --apply-fixes) APPLY_FIXES=true ;;
+        --force) FORCE_MODE=true ;;
         --local-ai-mode=*) LOCAL_AI_MODE_OVERRIDE="${arg#*=}" ;;
         --local-ai-minimal) LOCAL_AI_MODE_OVERRIDE="minimal" ;;
         --local-ai-full) LOCAL_AI_MODE_OVERRIDE="full" ;;
@@ -296,6 +298,7 @@ for arg in "$@"; do
             echo ""
             echo "Options:"
             echo "  --apply-fixes  Apply fixes automatically (requires root/sudo)"
+            echo "  --force        Downgrade unsupported-OS failure to warning (for users with Docker pre-installed)"
             echo "  --local-ai-mode=MODE  Set LOCAL_AI_MODE in .env (MODE=full|minimal)"
             echo "  --local-ai-minimal    Shortcut for --local-ai-mode=minimal"
             echo "  --local-ai-full       Shortcut for --local-ai-mode=full"
@@ -376,9 +379,52 @@ detect_os() {
         log_ok "Architecture: $ARCH"
     fi
     
+    # Check CPU compatibility for NumPy 2.x (requires SSE4.1/SSE4.2 aka X86_V2)
+    # NumPy 2.x requires these instructions; older KVM/QEMU VMs may lack them
+    if [ -f /proc/cpuinfo ]; then
+        if ! grep -qE 'sse4_1|sse4_2' /proc/cpuinfo 2>/dev/null; then
+            log_warn "CPU lacks SSE4.1/SSE4.2 (X86_V2) - NumPy 2.x incompatible"
+            log_info "  Your CPU does not support instructions required by NumPy 2.x"
+            log_info "  This commonly occurs on older KVM/QEMU VMs or pre-2013 CPUs"
+            
+            # Check if requirements.txt already has the fix
+            local needs_fix=false
+            if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
+                if ! grep -q 'numpy.*<2.0' "$SCRIPT_DIR/requirements.txt" 2>/dev/null; then
+                    needs_fix=true
+                fi
+            fi
+            
+            if [ "$needs_fix" = true ]; then
+                if [ "$APPLY_FIXES" = true ]; then
+                    log_info "  Applying fix: pinning numpy<2.0 in requirements files..."
+                    sed -i 's/numpy>=1.24.0/numpy>=1.24.0,<2.0/g' "$SCRIPT_DIR/requirements.txt" 2>/dev/null || true
+                    if [ -f "$SCRIPT_DIR/admin_ui/backend/requirements.txt" ]; then
+                        sed -i 's/numpy>=1.24.0/numpy>=1.24.0,<2.0/g' "$SCRIPT_DIR/admin_ui/backend/requirements.txt" 2>/dev/null || true
+                    fi
+                    log_ok "NumPy pinned to <2.0 for CPU compatibility"
+                    log_info "  Rebuild containers: docker compose build --no-cache ai_engine admin_ui"
+                else
+                    log_info "  Fix: Run with --apply-fixes to auto-pin numpy<2.0"
+                    log_info "  Or manually edit requirements.txt: numpy>=1.24.0,<2.0"
+                    FIX_CMDS+=("sed -i 's/numpy>=1.24.0/numpy>=1.24.0,<2.0/g' requirements.txt")
+                fi
+            else
+                log_ok "NumPy already pinned to <2.0 for CPU compatibility"
+            fi
+            log_info "  Docs: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/blob/main/docs/INSTALLATION.md#troubleshooting"
+        else
+            log_ok "CPU supports SSE4.1/SSE4.2 (NumPy 2.x compatible)"
+        fi
+    fi
+    
     # Check for unsupported OS family with helpful instructions
     if [ "$OS_FAMILY" = "unknown" ]; then
-        log_fail "Unsupported Linux distribution: $OS_ID"
+        if [ "$FORCE_MODE" = true ]; then
+            log_warn "Unsupported Linux distribution: $OS_ID (continuing due to --force)"
+        else
+            log_fail "Unsupported Linux distribution: $OS_ID"
+        fi
         log_info ""
         log_info "  Verified (maintainer-tested):"
         log_info "    - PBX Distro 12.7.8-2306-1.sng7 (Sangoma/FreePBX)"
@@ -395,7 +441,8 @@ detect_os() {
         log_info "  Supported platforms matrix:"
         log_info "    https://github.com/hkjarral/Asterisk-AI-Voice-Agent/blob/main/docs/SUPPORTED_PLATFORMS.md"
         log_info ""
-        log_info "  Then re-run this script to verify the setup."
+        log_info "  Then re-run with --force to skip this check:"
+        log_info "    ./preflight.sh --force"
     fi
     
     # Check EOL status (WARNING only - we still support if Docker works)
@@ -1316,6 +1363,70 @@ check_data_permissions() {
 }
 
 # ============================================================================
+# Secrets Directory Permissions (Vertex AI credentials, etc.)
+# ============================================================================
+check_secrets_permissions() {
+    local SECRETS_DIR="$SCRIPT_DIR/secrets"
+    local SHARED_GID
+    SHARED_GID="$(choose_shared_gid)"
+    local CONTAINER_UID="${CONTAINER_UID_DEFAULT}"
+
+    # Create secrets directory if it doesn't exist
+    if [ ! -d "$SECRETS_DIR" ]; then
+        if [ "$APPLY_FIXES" = true ]; then
+            mkdir -p "$SECRETS_DIR"
+            chown "$CONTAINER_UID:$SHARED_GID" "$SECRETS_DIR" 2>/dev/null || true
+            chmod 2770 "$SECRETS_DIR" 2>/dev/null || true
+            log_ok "Created secrets directory: $SECRETS_DIR"
+        else
+            log_warn "Secrets directory missing: $SECRETS_DIR"
+            log_info "  Required for Vertex AI service account JSON and other credentials"
+            log_info "  Run: sudo ./preflight.sh --apply-fixes to create it automatically"
+            FIX_CMDS+=("mkdir -p $SECRETS_DIR && chown $CONTAINER_UID:$SHARED_GID $SECRETS_DIR && chmod 2770 $SECRETS_DIR")
+        fi
+        return 0
+    fi
+
+    # Check directory permissions
+    local dir_uid dir_gid dir_mode
+    dir_uid="$(stat_uid "$SECRETS_DIR")"
+    dir_gid="$(stat_gid "$SECRETS_DIR")"
+    dir_mode="$(stat_mode "$SECRETS_DIR")"
+
+    local dir_needs_fix=false
+    # Check UID, GID, and mode (setgid bit important for group inheritance)
+    if [ "$dir_uid" != "$CONTAINER_UID" ]; then
+        dir_needs_fix=true
+    elif [ "$dir_gid" != "$SHARED_GID" ]; then
+        dir_needs_fix=true
+    elif [ "$dir_mode" != "2770" ] && [ "$dir_mode" != "770" ]; then
+        # Only allow 2770 or 770 - secrets must NOT be world-readable
+        dir_needs_fix=true
+    fi
+
+    if [ "$dir_needs_fix" = true ]; then
+        log_warn "Secrets directory not aligned for containers (host): $SECRETS_DIR"
+        log_info "  Expected: owner UID $CONTAINER_UID, mode 2770 (recommended), group GID $SHARED_GID"
+        log_info "  Detected: uid=${dir_uid:-unknown} gid=${dir_gid:-unknown} mode=${dir_mode:-unknown}"
+        if [ "$APPLY_FIXES" = true ]; then
+            if sudo chown -R "$CONTAINER_UID:$SHARED_GID" "$SECRETS_DIR" 2>/dev/null && sudo chmod 2770 "$SECRETS_DIR" 2>/dev/null; then
+                # Also fix any files inside
+                find "$SECRETS_DIR" -type f -exec sudo chmod 660 {} \; 2>/dev/null || true
+                log_ok "Fixed secrets directory permissions for containers"
+            else
+                log_warn "Could not fix secrets directory permissions (may need sudo)"
+            fi
+        else
+            FIX_CMDS+=("sudo chown -R $CONTAINER_UID:$SHARED_GID $SECRETS_DIR")
+            FIX_CMDS+=("sudo chmod 2770 $SECRETS_DIR")
+            FIX_CMDS+=("sudo find $SECRETS_DIR -type f -exec chmod 660 {} \\;")
+        fi
+    else
+        log_ok "Secrets directory permissions: OK (writable by containers)"
+    fi
+}
+
+# ============================================================================
 # SELinux (RHEL family)
 # ============================================================================
 check_selinux() {
@@ -1499,6 +1610,16 @@ check_env() {
 # ============================================================================
 # Asterisk Detection
 # ============================================================================
+_json_escape() {
+    local s="${1-}"
+    s=${s//\\/\\\\}
+    s=${s//\"/\\\"}
+    s=${s//$'\n'/\\n}
+    s=${s//$'\r'/\\r}
+    s=${s//$'\t'/\\t}
+    printf '%s' "$s"
+}
+
 check_asterisk() {
     ASTERISK_DIR=""
     ASTERISK_FOUND=false
@@ -1866,12 +1987,203 @@ check_asterisk_uid_gid() {
 }
 
 # ============================================================================
+# Asterisk Config Audit → JSON Manifest (AAVA: Asterisk Config Discovery)
+# ============================================================================
+check_asterisk_config() {
+    # Only run if Asterisk was detected on host
+    if [ "$ASTERISK_FOUND" != true ] || [ -z "$ASTERISK_DIR" ]; then
+        log_info "Asterisk config audit skipped (not detected on host)"
+        # Write minimal manifest so the UI knows preflight ran
+        _write_asterisk_manifest false "" "" false "" "{}"
+        return 0
+    fi
+
+    local APP_NAME
+    APP_NAME="$(grep -E '^[[:space:]]*app_name:' "$SCRIPT_DIR/config/ai-agent.yaml" 2>/dev/null | head -1 | sed 's/.*app_name:[[:space:]]*//' | tr -d '\r\n"'"'" || echo "asterisk-ai-voice-agent")"
+    [ -z "$APP_NAME" ] && APP_NAME="asterisk-ai-voice-agent"
+
+    local FREEPBX_DETECTED=false
+    local FREEPBX_VER=""
+    if [ -f "/etc/freepbx.conf" ] || [ -f "/etc/sangoma/pbx" ]; then
+        FREEPBX_DETECTED=true
+        FREEPBX_VER=$(fwconsole -V 2>/dev/null | head -1 || echo "detected")
+    fi
+
+    # --- ARI enabled check ---
+    local ari_enabled_ok=false
+    local ari_enabled_detail="not found"
+    # FreePBX splits config via #include; check both main and included files
+    for f in "$ASTERISK_DIR/ari.conf" "$ASTERISK_DIR/ari_general_additional.conf" "$ASTERISK_DIR/ari_general_custom.conf"; do
+        if [ -f "$f" ] && grep -qiE '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*yes' "$f" 2>/dev/null; then
+            ari_enabled_ok=true
+            ari_enabled_detail="enabled=yes in $(basename "$f")"
+            break
+        fi
+    done
+    if [ "$ari_enabled_ok" = true ]; then
+        log_ok "ARI enabled: $ari_enabled_detail"
+    else
+        log_warn "ARI not enabled in ari.conf (or included files)"
+        log_info "  Fix: ensure 'enabled=yes' under [general] in ari.conf or ari_general_custom.conf"
+    fi
+
+    # --- ARI user check ---
+    local ari_user_ok=false
+    local ari_user_detail="not found"
+    local ARI_USERNAME="${ASTERISK_ARI_USERNAME:-}"
+    [ -z "$ARI_USERNAME" ] && ARI_USERNAME="$(grep -E '^ASTERISK_ARI_USERNAME=' "$SCRIPT_DIR/.env" 2>/dev/null | cut -d= -f2 | tr -d '\r\n"'"'" || true)"
+    [ -z "$ARI_USERNAME" ] && ARI_USERNAME="AIAgent"
+    for f in "$ASTERISK_DIR/ari.conf" "$ASTERISK_DIR/ari_additional.conf" "$ASTERISK_DIR/ari_additional_custom.conf"; do
+        if [ -f "$f" ] && grep -qE "^\[$ARI_USERNAME\]" "$f" 2>/dev/null; then
+            ari_user_ok=true
+            ari_user_detail="[$ARI_USERNAME] found in $(basename "$f")"
+            break
+        fi
+    done
+    if [ "$ari_user_ok" = true ]; then
+        log_ok "ARI user: $ari_user_detail"
+    else
+        log_warn "ARI user [$ARI_USERNAME] not found in ari.conf (or included files)"
+        log_info "  Fix: add user block in ari_additional_custom.conf or via FreePBX Admin"
+    fi
+
+    # --- HTTP enabled check ---
+    local http_enabled_ok=false
+    local http_enabled_detail="not found"
+    for f in "$ASTERISK_DIR/http.conf" "$ASTERISK_DIR/http_additional.conf" "$ASTERISK_DIR/http_custom.conf"; do
+        if [ -f "$f" ] && grep -qiE '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*yes' "$f" 2>/dev/null; then
+            http_enabled_ok=true
+            http_enabled_detail="enabled=yes in $(basename "$f")"
+            break
+        fi
+    done
+    if [ "$http_enabled_ok" = true ]; then
+        log_ok "HTTP server: $http_enabled_detail"
+    else
+        log_warn "HTTP server not enabled in http.conf (or included files)"
+        log_info "  Fix: ensure 'enabled=yes' under [general] in http.conf or http_custom.conf"
+    fi
+
+    # --- Dialplan context check ---
+    local dialplan_ok=false
+    local dialplan_detail="not found"
+    if [ -f "$ASTERISK_DIR/extensions_custom.conf" ]; then
+        if grep -qiE "Stasis\($APP_NAME\)" "$ASTERISK_DIR/extensions_custom.conf" 2>/dev/null; then
+            dialplan_ok=true
+            dialplan_detail="Stasis($APP_NAME) in extensions_custom.conf"
+        fi
+    fi
+    if [ "$dialplan_ok" = true ]; then
+        log_ok "Dialplan context: $dialplan_detail"
+    else
+        log_warn "No Stasis($APP_NAME) context found in extensions_custom.conf"
+        log_info "  Fix: add a context with 'Stasis($APP_NAME)' to extensions_custom.conf"
+    fi
+
+    # --- Module checks (requires asterisk binary) ---
+    local mod_audiosocket_ok=false mod_audiosocket_detail="binary not available"
+    local mod_res_ari_ok=false mod_res_ari_detail="binary not available"
+    local mod_res_stasis_ok=false mod_res_stasis_detail="binary not available"
+    local mod_chan_pjsip_ok=false mod_chan_pjsip_detail="binary not available"
+
+    if command -v asterisk &>/dev/null; then
+        _check_ast_module "app_audiosocket" && mod_audiosocket_ok=true && mod_audiosocket_detail="Running"
+        [ "$mod_audiosocket_ok" = false ] && mod_audiosocket_detail="Not loaded"
+
+        _check_ast_module "res_ari" && mod_res_ari_ok=true && mod_res_ari_detail="Running"
+        [ "$mod_res_ari_ok" = false ] && mod_res_ari_detail="Not loaded"
+
+        _check_ast_module "res_stasis" && mod_res_stasis_ok=true && mod_res_stasis_detail="Running"
+        [ "$mod_res_stasis_ok" = false ] && mod_res_stasis_detail="Not loaded"
+
+        _check_ast_module "chan_pjsip" && mod_chan_pjsip_ok=true && mod_chan_pjsip_detail="Running"
+        [ "$mod_chan_pjsip_ok" = false ] && mod_chan_pjsip_detail="Not loaded"
+
+        log_ok "Asterisk modules: audiosocket=$mod_audiosocket_detail, res_ari=$mod_res_ari_detail, res_stasis=$mod_res_stasis_detail, chan_pjsip=$mod_chan_pjsip_detail"
+    else
+        log_info "Asterisk binary not in PATH — module checks skipped (will use ARI in Admin UI)"
+    fi
+
+    # --- Build JSON checks object ---
+    local ari_enabled_detail_e ari_user_detail_e http_enabled_detail_e dialplan_detail_e
+    local mod_audiosocket_detail_e mod_res_ari_detail_e mod_res_stasis_detail_e mod_chan_pjsip_detail_e
+    ari_enabled_detail_e=$(_json_escape "$ari_enabled_detail")
+    ari_user_detail_e=$(_json_escape "$ari_user_detail")
+    http_enabled_detail_e=$(_json_escape "$http_enabled_detail")
+    dialplan_detail_e=$(_json_escape "$dialplan_detail")
+    mod_audiosocket_detail_e=$(_json_escape "$mod_audiosocket_detail")
+    mod_res_ari_detail_e=$(_json_escape "$mod_res_ari_detail")
+    mod_res_stasis_detail_e=$(_json_escape "$mod_res_stasis_detail")
+    mod_chan_pjsip_detail_e=$(_json_escape "$mod_chan_pjsip_detail")
+
+    local CHECKS
+    CHECKS=$(cat <<JSONEOF
+{
+    "ari_enabled": { "ok": $ari_enabled_ok, "detail": "$ari_enabled_detail_e" },
+    "ari_user": { "ok": $ari_user_ok, "detail": "$ari_user_detail_e" },
+    "http_enabled": { "ok": $http_enabled_ok, "detail": "$http_enabled_detail_e" },
+    "dialplan_context": { "ok": $dialplan_ok, "detail": "$dialplan_detail_e" },
+    "module_app_audiosocket": { "ok": $mod_audiosocket_ok, "detail": "$mod_audiosocket_detail_e" },
+    "module_res_ari": { "ok": $mod_res_ari_ok, "detail": "$mod_res_ari_detail_e" },
+    "module_res_stasis": { "ok": $mod_res_stasis_ok, "detail": "$mod_res_stasis_detail_e" },
+    "module_chan_pjsip": { "ok": $mod_chan_pjsip_ok, "detail": "$mod_chan_pjsip_detail_e" }
+}
+JSONEOF
+    )
+
+    _write_asterisk_manifest true "${ASTERISK_VERSION:-unknown}" "$ASTERISK_DIR" "$FREEPBX_DETECTED" "$FREEPBX_VER" "$CHECKS"
+}
+
+# Helper: check if an Asterisk module is loaded via CLI
+_check_ast_module() {
+    local mod_name="$1"
+    local output
+    output=$(asterisk -rx "module show like $mod_name" 2>/dev/null || true)
+    echo "$output" | grep -qiE "$mod_name.*Running"
+}
+
+# Helper: write the JSON manifest to data/asterisk_status.json
+_write_asterisk_manifest() {
+    local ast_found="$1" ast_version="$2" config_dir="$3" fpbx_detected="$4" fpbx_version="$5" checks_json="$6"
+    local MANIFEST_DIR="$SCRIPT_DIR/data"
+    local MANIFEST_FILE="$MANIFEST_DIR/asterisk_status.json"
+    local TIMESTAMP
+    TIMESTAMP="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")"
+    local timestamp_e ast_version_e config_dir_e fpbx_version_e
+    timestamp_e=$(_json_escape "$TIMESTAMP")
+    ast_version_e=$(_json_escape "$ast_version")
+    config_dir_e=$(_json_escape "$config_dir")
+    fpbx_version_e=$(_json_escape "$fpbx_version")
+
+    mkdir -p "$MANIFEST_DIR" 2>/dev/null || true
+
+    cat > "$MANIFEST_FILE" <<MANIFESTEOF
+{
+    "timestamp": "$timestamp_e",
+    "asterisk_found": $ast_found,
+    "asterisk_version": "$ast_version_e",
+    "config_dir": "$config_dir_e",
+    "freepbx": {
+        "detected": $fpbx_detected,
+        "version": "$fpbx_version_e"
+    },
+    "checks": $checks_json
+}
+MANIFESTEOF
+
+    if [ -f "$MANIFEST_FILE" ]; then
+        log_ok "Asterisk config manifest: $MANIFEST_FILE"
+    else
+        log_warn "Could not write Asterisk config manifest to $MANIFEST_FILE"
+    fi
+}
+
+# ============================================================================
 # GPU Detection (AAVA-140)
 # ============================================================================
 check_gpu() {
     GPU_AVAILABLE=false
     GPU_NAME=""
-    GPU_PASSTHROUGH_OK=false
     
     # Step 1: Check if nvidia-smi exists on host
     if ! command -v nvidia-smi &>/dev/null; then
@@ -1930,9 +2242,25 @@ check_gpu() {
     
     # Step 4: Test Docker GPU passthrough
     log_info "Testing Docker GPU passthrough..."
-    if docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi &>/dev/null 2>&1; then
-        GPU_PASSTHROUGH_OK=true
+    local cuda_test_images=(
+        "nvidia/cuda:12.0.0-base-ubi8"
+        "nvidia/cuda:12.0-base"
+        "nvidia/cuda:12.4.1-base-ubuntu22.04"
+    )
+    local passthrough_test_ok=false
+    local working_cuda_test_image=""
+    local cuda_test_image
+    for cuda_test_image in "${cuda_test_images[@]}"; do
+        if docker run --rm --gpus all "$cuda_test_image" nvidia-smi &>/dev/null 2>&1; then
+            passthrough_test_ok=true
+            working_cuda_test_image="$cuda_test_image"
+            break
+        fi
+    done
+
+    if [ "$passthrough_test_ok" = true ]; then
         log_ok "Docker GPU passthrough working"
+        log_info "  Verified with image: $working_cuda_test_image"
         update_env_gpu "true"
         
         # Inform user - GPU detection works via .env, no workflow change needed
@@ -1942,7 +2270,7 @@ check_gpu() {
         log_info "  To use GPU for LLM inference (optional, faster responses):"
         log_info "    1. Set LOCAL_LLM_GPU_LAYERS=-1 in .env"
         log_info "    2. Start local_ai_server with GPU override:"
-        log_info "       ${COMPOSE_CMD:-docker compose} -p asterisk-ai-voice-agent -f docker-compose.yml -f docker-compose.gpu.yml up -d local_ai_server"
+        log_info "       ${COMPOSE_CMD:-docker compose} -p asterisk-ai-voice-agent -f docker-compose.yml -f docker-compose.gpu.yml up -d --build local_ai_server"
     else
         log_warn "Docker GPU passthrough test failed"
         log_info "  GPU detected and toolkit installed, but Docker cannot access GPU"
@@ -2049,6 +2377,7 @@ apply_fixes() {
         check_directories >/dev/null 2>&1
         check_project_permissions >/dev/null 2>&1
         check_data_permissions >/dev/null 2>&1
+        check_secrets_permissions >/dev/null 2>&1
         check_selinux >/dev/null 2>&1
         check_env >/dev/null 2>&1
         check_docker_gid >/dev/null 2>&1
@@ -2212,11 +2541,13 @@ main() {
     check_directories
     check_project_permissions
     check_data_permissions  # AAVA-150: Always runs, regardless of Asterisk location
+    check_secrets_permissions  # AAVA-191: Vertex AI credentials directory
     check_selinux
     check_env
     check_docker_gid
     check_asterisk
     check_asterisk_uid_gid
+    check_asterisk_config
     check_gpu
     check_ports
     

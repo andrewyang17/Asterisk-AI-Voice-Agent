@@ -6,7 +6,7 @@ Go-based command-line interface for Asterisk AI Voice Agent operations.
 
 The `agent` CLI provides a comprehensive set of tools for setup, diagnostics, and troubleshooting. All commands are built as a single Go binary for easy distribution.
 
-**Current Status**: ✅ CLI v5.3.1 (simplified surface)
+**Current Status**: ✅ CLI v6.2.0 (simplified surface)
 
 ## Available Commands
 
@@ -16,7 +16,7 @@ The `agent` CLI provides a comprehensive set of tools for setup, diagnostics, an
 - **`agent update`** - Pull latest code + rebuild/restart as needed
 - **`agent version`** - Show version information
 
-Legacy aliases (hidden from `--help` in v5.3.1):
+Legacy aliases (hidden from `--help` in v6.2.0):
 - `agent init` → `agent setup`
 - `agent doctor` → `agent check`
 - `agent troubleshoot` → `agent rca`
@@ -120,7 +120,7 @@ agent setup
 
 **Steps:**
 1. **Asterisk ARI Connection** - Host, username, password validation
-2. **Audio Transport** - AudioSocket (modern) or ExternalMedia RTP (legacy)
+2. **Audio Transport** - AudioSocket (default) or ExternalMedia RTP
 3. **AI Provider** - OpenAI, Deepgram, Google, or Local Hybrid
 4. **Configuration Review** - Saves to `.env` and restarts services
 
@@ -238,7 +238,7 @@ agent troubleshoot --last --symptom <no-audio|garbled|echo|interruption|one-way>
 
 ## Hidden (Legacy) Commands
 
-CLI v5.3.1 intentionally keeps a small visible surface (`agent setup/check/rca/update/version`). For backwards compatibility and advanced workflows, these commands still exist but are hidden from `agent --help`:
+CLI v6.2.0 intentionally keeps a small visible surface (`agent setup/check/rca/update/version`). For backwards compatibility and advanced workflows, these commands still exist but are hidden from `agent --help`:
 
 - Compatibility aliases: `agent init`, `agent doctor`, `agent troubleshoot`
 - Advanced tools: `agent demo`, `agent dialplan`, `agent config validate`
@@ -253,7 +253,9 @@ agent update
 ```
 
 Notes:
-- Creates backups of `.env` and `config/ai-agent.yaml` before updating.
+- Creates backups of `.env`, `config/ai-agent.local.yaml`, `config/users.json`, and `config/contexts/` before updating.
+- Also snapshots `config/ai-agent.yaml` (base config) so the updater can migrate legacy local edits into `config/ai-agent.local.yaml`.
+- If a `git stash pop` conflict occurs (commonly caused by local edits to `config/ai-agent.yaml`), the updater automatically recovers: resets the working tree, drops the failed stash, restores operator config from the pre-update backup, and migrates any `ai-agent.yaml` edits into `ai-agent.local.yaml`.
 - Uses fast-forward only; if your local branch has diverged, it will stop and print guidance.
 - Rebuilds/restarts only the impacted services, then runs `agent check` (unless `--skip-check`).
 - If a newer CLI release is available, `agent update` can self-update the `agent` binary first (default; disable with `--self-update=false`).
@@ -321,9 +323,9 @@ echo "✅ Validation passed - deploying..."
 cli/
 ├── cmd/agent/           # Main CLI commands
 │   ├── main.go          # Root command and app entry
-│   ├── setup.go         # Interactive setup wizard (v5.3.1)
-│   ├── check.go         # Standard diagnostics report (v5.3.1)
-│   ├── rca.go           # Post-call RCA (v5.3.1)
+│   ├── setup.go         # Interactive setup wizard
+│   ├── check.go         # Standard diagnostics report
+│   ├── rca.go           # Post-call RCA
 │   └── version.go       # Version command
 │
 │   # Hidden (legacy / advanced)

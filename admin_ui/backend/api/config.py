@@ -9,6 +9,9 @@ import glob
 import tempfile
 import sys
 import logging
+import ssl
+import smtplib
+from email.message import EmailMessage
 from contextlib import contextmanager
 from pydantic import BaseModel
 from typing import Dict, Any, Optional, Union
@@ -20,6 +23,88 @@ MAX_BACKUPS = 5
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+def _is_prefix(key: str, prefixes: tuple[str, ...]) -> bool:
+    return any(key.startswith(p) for p in prefixes)
+
+
+def _running_container_names() -> set:
+    """Return a set of container names that are currently running."""
+    try:
+        import docker  # type: ignore
+        client = docker.from_env()
+        return {c.name for c in client.containers.list(filters={"status": "running"})}
+    except Exception:
+        return set()
+
+
+def _upsert_env_key(key: str, value: str) -> None:
+    """Insert or update a single key in the project .env file."""
+    env_path = settings.ENV_PATH
+    lines: list[str] = []
+    if os.path.exists(env_path):
+        with open(env_path, "r") as f:
+            lines = f.readlines()
+
+    found = False
+    for i, line in enumerate(lines):
+        stripped = line.lstrip("# ").strip()
+        if stripped.startswith(f"{key}="):
+            lines[i] = f"{key}={value}\n"
+            found = True
+            break
+
+    if not found:
+        if lines and not lines[-1].endswith("\n"):
+            lines.append("\n")
+        lines.append(f"{key}={value}\n")
+
+    with open(env_path, "w") as f:
+        f.writelines(lines)
+
+
+def _ai_engine_env_key(key: str) -> bool:
+    return (
+        # Track .env-owned health settings that require ai_engine recreate when changed.
+        # Keep HEALTH_BIND_HOST excluded because compose can inject it even when unset,
+        # which otherwise causes perpetual drift in Env UI.
+        _is_prefix(key, ("ASTERISK_", "LOG_", "DIAG_", "CALL_HISTORY_", "HEALTH_CHECK_"))
+        or key in ("HEALTH_API_TOKEN", "HEALTH_BIND_PORT")
+        or key in (
+            "OPENAI_API_KEY",
+            "GROQ_API_KEY",
+            "DEEPGRAM_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_CLOUD_PROJECT",  # Vertex AI
+            "GOOGLE_CLOUD_LOCATION",  # Vertex AI
+            "GOOGLE_APPLICATION_CREDENTIALS",  # Vertex AI service account
+            "TELNYX_API_KEY",
+            "RESEND_API_KEY",
+            "ELEVENLABS_API_KEY",
+            "ELEVENLABS_AGENT_ID",
+            "TZ",
+            "STREAMING_LOG_LEVEL",
+        )
+        or _is_prefix(key, ("AUDIO_TRANSPORT", "DOWNSTREAM_MODE", "AUDIOSOCKET_", "EXTERNAL_MEDIA_", "BARGE_IN_"))
+        or _is_prefix(key, ("SMTP_",))
+        # Local provider runtime uses these env vars via ${LOCAL_WS_*} placeholders in ai-agent.yaml
+        or _is_prefix(key, ("LOCAL_WS_",))
+    )
+
+
+def _local_ai_env_key(key: str) -> bool:
+    return (
+        _is_prefix(key, ("LOCAL_", "KROKO_", "FASTER_WHISPER_", "WHISPER_CPP_", "MELOTTS_", "KOKORO_"))
+        or key in ("SHERPA_MODEL_PATH",)
+    )
+
+
+def _admin_ui_env_key(key: str) -> bool:
+    return (
+        key in ("JWT_SECRET", "DOCKER_SOCK", "DOCKER_GID", "TZ")
+        or _is_prefix(key, ("UVICORN_", "ADMIN_UI_"))
+    )
+
 
 def _assert_no_duplicate_yaml_keys(node: yaml.Node) -> None:
     """
@@ -57,6 +142,145 @@ def _safe_load_no_duplicates(content: str):
         _assert_no_duplicate_yaml_keys(node)
     return yaml.safe_load(content)
 
+
+def _deep_merge_dicts(base: dict, override: dict) -> dict:
+    """
+    Recursively deep-merge *override* into a copy of *base*.
+
+    Deletion semantics:
+    - If the override explicitly sets a key to null/None, that key is removed from
+      the merged output. This is important because our operator override file is
+      merged on top of a git-tracked base file and needs a way to represent
+      "delete this upstream default".
+    """
+    merged = dict(base)
+    for key, override_val in override.items():
+        if override_val is None:
+            merged.pop(key, None)
+            continue
+        base_val = merged.get(key)
+        if isinstance(base_val, dict) and isinstance(override_val, dict):
+            merged[key] = _deep_merge_dicts(base_val, override_val)
+        else:
+            merged[key] = override_val
+    return merged
+
+
+def _read_base_config_dict() -> dict:
+    """Read base config/ai-agent.yaml as a dict (no local overrides)."""
+    if not os.path.exists(settings.CONFIG_PATH):
+        return {}
+    with open(settings.CONFIG_PATH, "r") as f:
+        base = _safe_load_no_duplicates(f.read()) or {}
+    return base if isinstance(base, dict) else {}
+
+
+def _compute_local_override(base: dict, desired: dict) -> dict:
+    """
+    Compute a minimal operator-local override that, when merged over *base*,
+    yields *desired* (including deletions via null tombstones).
+    """
+    if not isinstance(base, dict) or not isinstance(desired, dict):
+        # Defensive: treat the desired value as a full replacement.
+        return desired
+
+    override: dict = {}
+
+    # Include updates/additions.
+    for key, desired_val in desired.items():
+        if key not in base:
+            override[key] = desired_val
+            continue
+
+        base_val = base.get(key)
+        if isinstance(base_val, dict) and isinstance(desired_val, dict):
+            child = _compute_local_override(base_val, desired_val)
+            if child:
+                override[key] = child
+            continue
+
+        if base_val != desired_val:
+            override[key] = desired_val
+
+    # Include deletions (tombstones).
+    for key in base.keys():
+        if key not in desired:
+            override[key] = None
+
+    return override
+
+
+def _read_merged_config_dict() -> dict:
+    """
+    Read and return the merged config (base + local override) as a dict.
+
+    Loads ``config/ai-agent.yaml`` (base), then deep-merges
+    ``config/ai-agent.local.yaml`` (operator overrides) on top if it exists.
+    """
+    if not os.path.exists(settings.CONFIG_PATH):
+        return {}
+    with open(settings.CONFIG_PATH, "r") as f:
+        base = _safe_load_no_duplicates(f.read()) or {}
+
+    if not os.path.exists(settings.LOCAL_CONFIG_PATH):
+        return base
+
+    try:
+        with open(settings.LOCAL_CONFIG_PATH, "r") as f:
+            local = _safe_load_no_duplicates(f.read()) or {}
+    except Exception:
+        return base
+
+    if not isinstance(local, dict):
+        return base
+
+    return _deep_merge_dicts(base, local)
+
+
+def _read_merged_config_content() -> str:
+    """Return the merged config as a YAML string (for display / validation)."""
+    merged = _read_merged_config_dict()
+    return yaml.dump(merged, default_flow_style=False, sort_keys=False) if merged else ""
+
+
+def _write_local_config(content: str) -> None:
+    """
+    Atomically write *content* to the local override config file.
+
+    Creates a backup of the existing local file (if any), validates permissions,
+    and performs an atomic temp-file + rename write.
+    """
+    import datetime
+    dir_path = os.path.dirname(settings.LOCAL_CONFIG_PATH)
+    if dir_path:
+        os.makedirs(dir_path, exist_ok=True)
+
+    # Backup existing local file
+    if os.path.exists(settings.LOCAL_CONFIG_PATH):
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = f"{settings.LOCAL_CONFIG_PATH}.bak.{timestamp}"
+        with open(settings.LOCAL_CONFIG_PATH, "r") as src:
+            with open(backup_path, "w") as dst:
+                dst.write(src.read())
+        _rotate_backups(settings.LOCAL_CONFIG_PATH)
+
+    # Preserve permissions from existing local or base file
+    original_mode = None
+    for candidate in (settings.LOCAL_CONFIG_PATH, settings.CONFIG_PATH):
+        if os.path.exists(candidate):
+            original_mode = os.stat(candidate).st_mode
+            break
+
+    with tempfile.NamedTemporaryFile("w", dir=dir_path, delete=False, suffix=".tmp") as f:
+        f.write(content)
+        temp_path = f.name
+
+    if original_mode is not None:
+        os.chmod(temp_path, original_mode)
+
+    os.replace(temp_path, settings.LOCAL_CONFIG_PATH)
+
+
 # Regex to strip ANSI escape codes from logs
 ANSI_ESCAPE = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
 
@@ -69,6 +293,31 @@ def _url_host(url: str) -> str:
         return (urlparse(str(url)).hostname or "").lower()
     except Exception:
         return ""
+
+
+# SECURITY: Hardcoded base URLs for provider validation requests.
+# Maps hostname → canonical base URL.  This prevents SSRF via user-supplied
+# chat_base_url in YAML config by never forwarding the raw user string.
+_SAFE_BASE_URLS: dict[str, str] = {
+    "api.telnyx.com": "https://api.telnyx.com/v2/ai",
+    "api.openai.com": "https://api.openai.com/v1",
+    "api.groq.com": "https://api.groq.com/openai/v1",
+    "openrouter.ai": "https://openrouter.ai/api/v1",
+    "api.anthropic.com": "https://api.anthropic.com/v1",
+    "api.deepgram.com": "https://api.deepgram.com/v1",
+    "api.elevenlabs.io": "https://api.elevenlabs.io/v1",
+    "generativelanguage.googleapis.com": "https://generativelanguage.googleapis.com/v1beta",
+}
+
+
+def _safe_base_url(user_url: str, fallback: str) -> str:
+    """Return a hardcoded base URL for a known provider host, or *fallback*.
+
+    The returned string is NEVER derived from *user_url* — only the hostname
+    is extracted for lookup.  This breaks the CodeQL taint chain.
+    """
+    host = _url_host(user_url)
+    return _SAFE_BASE_URLS.get(host, fallback)
 
 
 def _rotate_backups(base_path: str) -> None:
@@ -299,33 +548,21 @@ async def update_yaml_config(update: ConfigUpdate):
         validation = _validate_ai_agent_config(update.content)
         warnings = validation.get("warnings") or []
 
-        # Create backup before saving
-        if os.path.exists(settings.CONFIG_PATH):
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = f"{settings.CONFIG_PATH}.bak.{timestamp}"
-            with open(settings.CONFIG_PATH, 'r') as src:
-                with open(backup_path, 'w') as dst:
-                    dst.write(src.read())
-            # A11: Rotate backups - keep only last MAX_BACKUPS
-            _rotate_backups(settings.CONFIG_PATH)
+        # Snapshot current merged config for hot-reload comparison
+        old_merged = _read_merged_config_dict()
 
-        # A8: Atomic write via temp file + rename (preserve permissions)
-        dir_path = os.path.dirname(settings.CONFIG_PATH)
-        # Get original file permissions if file exists
-        original_mode = None
-        if os.path.exists(settings.CONFIG_PATH):
-            original_mode = os.stat(settings.CONFIG_PATH).st_mode
-        
-        with tempfile.NamedTemporaryFile('w', dir=dir_path, delete=False, suffix='.tmp') as f:
-            f.write(update.content)
-            temp_path = f.name
-        
-        # Restore original permissions before replace
-        if original_mode is not None:
-            os.chmod(temp_path, original_mode)
-        
-        os.replace(temp_path, settings.CONFIG_PATH)  # Atomic on POSIX
+        # Parse desired merged config content from UI.
+        new_parsed = _safe_load_no_duplicates(update.content) or {}
+        if not isinstance(new_parsed, dict):
+            raise HTTPException(status_code=400, detail="Config YAML must be a mapping at the top level")
+
+        # Convert desired merged config into a minimal local override (supports deletions).
+        base = _read_base_config_dict()
+        local_override = _compute_local_override(base, new_parsed)
+        local_content = yaml.dump(local_override or {}, default_flow_style=False, sort_keys=False)
+
+        # Write to LOCAL override file (keeps base ai-agent.yaml clean for git)
+        _write_local_config(local_content)
         
         # Determine recommended apply method based on what changed
         # hot_reload: contexts, MCP servers, greetings/instructions only
@@ -335,26 +572,15 @@ async def update_yaml_config(update: ConfigUpdate):
         
         # Check if change is limited to hot-reloadable sections
         try:
-            old_content = None
-            # Read the backup we just created to compare
-            import glob
-            backups = sorted(glob.glob(f"{settings.CONFIG_PATH}.bak.*"), reverse=True)
-            if backups:
-                with open(backups[0], 'r') as f:
-                    old_content = f.read()
-            
-            if old_content:
-                old_parsed = _safe_load_no_duplicates(old_content) or {}
-                new_parsed = _safe_load_no_duplicates(update.content) or {}
-                
+            if old_merged:
                 # Keys that can be hot-reloaded
                 hot_reload_keys = {'contexts', 'profiles', 'mcp'}
                 
                 # Check if only hot-reloadable keys changed
-                all_keys = set(old_parsed.keys()) | set(new_parsed.keys())
+                all_keys = set(old_merged.keys()) | set(new_parsed.keys())
                 changed_keys = set()
                 for key in all_keys:
-                    if old_parsed.get(key) != new_parsed.get(key):
+                    if old_merged.get(key) != new_parsed.get(key):
                         changed_keys.add(key)
                 
                 if changed_keys and changed_keys.issubset(hot_reload_keys):
@@ -386,8 +612,9 @@ async def get_yaml_config():
         print("Config file not found")
         raise HTTPException(status_code=404, detail="Config file not found")
     try:
-        with open(settings.CONFIG_PATH, 'r') as f:
-            config_content = f.read()
+        # Return the merged config (base + local overrides) so the editor
+        # always shows the effective configuration the engine will use.
+        config_content = _read_merged_config_content()
         _safe_load_no_duplicates(config_content)  # Validate YAML and reject duplicate keys
         return {"content": config_content}
     except yaml.YAMLError as e:
@@ -637,40 +864,24 @@ async def update_env(env_data: Dict[str, Optional[str]]):
         
         changed_keys = sorted(set(keys_to_update) | set(keys_to_delete))
 
-        def _is_prefix(key: str, prefixes: tuple[str, ...]) -> bool:
-            return any(key.startswith(p) for p in prefixes)
-
-        def _ai_engine_env_key(key: str) -> bool:
-            return (
-                _is_prefix(key, ("ASTERISK_", "LOG_", "DIAG_", "CALL_HISTORY_", "HEALTH_"))
-                or key in ("OPENAI_API_KEY", "DEEPGRAM_API_KEY", "GOOGLE_API_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS_AGENT_ID", "TZ", "STREAMING_LOG_LEVEL")
-                or _is_prefix(key, ("AUDIO_TRANSPORT", "DOWNSTREAM_MODE", "AUDIOSOCKET_", "EXTERNAL_MEDIA_", "BARGE_IN_"))
-                # Local provider runtime uses these env vars via ${LOCAL_WS_*} placeholders in ai-agent.yaml
-                or _is_prefix(key, ("LOCAL_WS_",))
-            )
-
-        def _local_ai_env_key(key: str) -> bool:
-            return (
-                _is_prefix(key, ("LOCAL_", "KROKO_", "FASTER_WHISPER_", "WHISPER_CPP_", "MELOTTS_", "KOKORO_"))
-                or key in ("SHERPA_MODEL_PATH",)
-            )
-
-        def _admin_ui_env_key(key: str) -> bool:
-            return (
-                key in ("JWT_SECRET", "DOCKER_SOCK", "DOCKER_GID", "TZ")
-                or _is_prefix(key, ("UVICORN_", "ADMIN_UI_"))
-            )
-
         impacts_ai_engine = any(_ai_engine_env_key(k) for k in changed_keys)
         impacts_local_ai = any(_local_ai_env_key(k) for k in changed_keys)
         impacts_admin_ui = any(_admin_ui_env_key(k) for k in changed_keys)
 
+        # Only suggest restart for containers that are actually running.
+        # This avoids confusing "Apply Changes" prompts for e.g. local_ai_server
+        # when it is not deployed.
+        running = _running_container_names()
+
         apply_plan = []
-        if impacts_ai_engine:
-            apply_plan.append({"service": "ai_engine", "method": "restart", "endpoint": "/api/system/containers/ai_engine/restart"})
-        if impacts_local_ai:
-            apply_plan.append({"service": "local_ai_server", "method": "restart", "endpoint": "/api/system/containers/local_ai_server/restart"})
-        if impacts_admin_ui:
+        # NOTE: For ai_engine/local_ai_server, env_file (.env) changes require a force-recreate.
+        # The frontend calls /restart?recreate=true for these services.
+        if impacts_ai_engine and "ai_engine" in running:
+            apply_plan.append({"service": "ai_engine", "method": "recreate", "endpoint": "/api/system/containers/ai_engine/restart"})
+        if impacts_local_ai and "local_ai_server" in running:
+            apply_plan.append({"service": "local_ai_server", "method": "recreate", "endpoint": "/api/system/containers/local_ai_server/restart"})
+        if impacts_admin_ui and "admin_ui" in running:
+            # Admin UI reads .env from disk at startup; a restart is sufficient in most cases.
             apply_plan.append({"service": "admin_ui", "method": "restart", "endpoint": "/api/system/containers/admin_ui/restart"})
 
         message = "Environment saved. Restart impacted services to apply changes."
@@ -690,9 +901,103 @@ async def update_env(env_data: Dict[str, Optional[str]]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@router.get("/env/status")
+async def get_env_status():
+    """
+    Detect whether the running containers are out-of-sync with the project's `.env` file.
+
+    This allows the UI to keep showing a correct "Apply Changes" plan even after a refresh,
+    since `.env` edits persist but container environments only update on recreate/restart.
+    """
+    try:
+        from dotenv import dotenv_values
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="python-dotenv is required for env status") from e
+
+    env_map = dotenv_values(settings.ENV_PATH) if os.path.exists(settings.ENV_PATH) else {}
+    env_map = {k: str(v) for k, v in (env_map or {}).items() if k and v is not None}
+
+    try:
+        import docker  # type: ignore
+        client = docker.from_env()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Docker unavailable for env status: {str(e)}")
+
+    def _container_env(name: str) -> Dict[str, str]:
+        try:
+            c = client.containers.get(name)
+            raw = (c.attrs.get("Config", {}) or {}).get("Env", []) or []
+            out: Dict[str, str] = {}
+            for item in raw:
+                if not isinstance(item, str) or "=" not in item:
+                    continue
+                k, v = item.split("=", 1)
+                out[str(k)] = str(v)
+            return out
+        except Exception:
+            return {}
+
+    def _diff_keys(*, desired: Dict[str, str], actual: Dict[str, str], key_pred) -> list[str]:
+        keys = set()
+        keys.update([k for k in desired.keys() if key_pred(k)])
+        keys.update([k for k in actual.keys() if key_pred(k)])
+        diffs = []
+        for k in sorted(keys):
+            want = str(desired.get(k, "") or "")
+            got = str(actual.get(k, "") or "")
+            if want != got:
+                diffs.append(k)
+        return diffs
+
+    # Only compute drift for containers that are actually running.
+    # Comparing .env against a non-existent container yields false drift for
+    # every matching key (e.g. all LOCAL_* keys when local_ai_server is absent).
+    running = _running_container_names()
+
+    ai_env = _container_env("ai_engine") if "ai_engine" in running else {}
+    local_env = _container_env("local_ai_server") if "local_ai_server" in running else {}
+    admin_env = _container_env("admin_ui") if "admin_ui" in running else {}
+
+    drift_ai = _diff_keys(desired=env_map, actual=ai_env, key_pred=_ai_engine_env_key) if "ai_engine" in running else []
+    drift_local = _diff_keys(desired=env_map, actual=local_env, key_pred=_local_ai_env_key) if "local_ai_server" in running else []
+    drift_admin = _diff_keys(desired=env_map, actual=admin_env, key_pred=_admin_ui_env_key) if "admin_ui" in running else []
+
+    apply_plan = []
+    if drift_local:
+        apply_plan.append({"service": "local_ai_server", "method": "recreate", "endpoint": "/api/system/containers/local_ai_server/restart"})
+    if drift_ai:
+        apply_plan.append({"service": "ai_engine", "method": "recreate", "endpoint": "/api/system/containers/ai_engine/restart"})
+    if drift_admin:
+        apply_plan.append({"service": "admin_ui", "method": "restart", "endpoint": "/api/system/containers/admin_ui/restart"})
+
+    return {
+        "pending_restart": bool(apply_plan),
+        "apply_plan": apply_plan,
+        "drift": {
+            "ai_engine": drift_ai,
+            "local_ai_server": drift_local,
+            "admin_ui": drift_admin,
+        },
+    }
+
 class ProviderTestRequest(BaseModel):
     name: str
     config: Dict[str, Any]
+
+class SmtpTestRequest(BaseModel):
+    to_email: str
+    from_email: Optional[str] = None
+    subject: Optional[str] = None
+    text: Optional[str] = None
+    # Optional overrides (when testing unsaved UI form values).
+    smtp_host: Optional[str] = None
+    smtp_port: Optional[Union[int, str]] = None
+    smtp_username: Optional[str] = None
+    smtp_password: Optional[str] = None
+    smtp_tls_mode: Optional[str] = None  # starttls | smtps | none
+    smtp_tls_verify: Optional[Union[bool, str]] = None
+    smtp_timeout_seconds: Optional[Union[float, str]] = None
 
 @router.post("/providers/test")
 async def test_provider_connection(request: ProviderTestRequest):
@@ -859,10 +1164,86 @@ async def test_provider_connection(request: ProviderTestRequest):
                 return {"success": False, "message": f"OpenAI API error: HTTP {response.status_code}"}
 
         # ============================================================
-        # OPENAI-COMPATIBLE (OpenAI / Groq / OpenRouter / etc.)
+        # TELNYX (OpenAI-compatible) - validate /models + a tiny /chat/completions
         # ============================================================
-        if provider_config.get('type') == 'openai':
-            chat_base_url = (provider_config.get('chat_base_url') or 'https://api.openai.com/v1').rstrip('/')
+        provider_type = str(provider_config.get('type') or '').lower()
+        chat_base_url = (provider_config.get('chat_base_url') or provider_config.get('base_url') or '').rstrip('/')
+        host = _url_host(chat_base_url)
+        is_telnyx = provider_type in ('telnyx', 'telenyx') or ('telnyx' in provider_name) or host == 'api.telnyx.com'
+        if is_telnyx:
+            base_url = _safe_base_url(chat_base_url, 'https://api.telnyx.com/v2/ai')
+            api_key = get_env_key('TELNYX_API_KEY') or os.getenv('TELNYX_API_KEY') or ''
+            if not api_key:
+                return {"success": False, "message": "TELNYX_API_KEY not set in .env"}
+
+            # Prefer explicit model config; if unset, use a safe default for testing.
+            model = (provider_config.get('chat_model') or provider_config.get('model') or '').strip()
+            if not model:
+                model = "Qwen/Qwen3-235B-A22B"
+
+            api_key_ref = (provider_config.get('api_key_ref') or '').strip()
+            if model.startswith('openai/') and not api_key_ref:
+                return {
+                    "success": False,
+                    "message": "Telnyx external models like openai/* require api_key_ref (Integration Secret identifier).",
+                }
+
+            def _telnyx_error_summary(resp: httpx.Response) -> str:
+                try:
+                    j = resp.json()
+                    if isinstance(j, dict) and isinstance(j.get("errors"), list) and j["errors"]:
+                        e0 = j["errors"][0] if isinstance(j["errors"][0], dict) else {}
+                        code = e0.get("code")
+                        title = e0.get("title")
+                        detail = e0.get("detail")
+                        parts = [p for p in [code, title, detail] if p]
+                        if parts:
+                            return " / ".join(str(p) for p in parts)
+                except Exception:
+                    pass
+                text = (resp.text or "").strip().replace("\n", " ")
+                return text[:180] if text else f"HTTP {resp.status_code}"
+
+            try:
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    models_resp = await client.get(
+                        f"{base_url}/models",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                    )
+                    if models_resp.status_code != 200:
+                        return {"success": False, "message": f"Telnyx /models failed: {_telnyx_error_summary(models_resp)}"}
+
+                    payload: Dict[str, Any] = {
+                        "model": model,
+                        "messages": [
+                            {"role": "system", "content": "You are a test assistant."},
+                            {"role": "user", "content": "Reply with exactly: OK"},
+                        ],
+                        "temperature": 0.0,
+                        "max_tokens": 16,
+                    }
+                    if api_key_ref:
+                        payload["api_key_ref"] = api_key_ref
+
+                    chat_resp = await client.post(
+                        f"{base_url}/chat/completions",
+                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        json=payload,
+                    )
+                    if chat_resp.status_code == 200:
+                        return {"success": True, "message": f"Connected to Telnyx. Chat completion OK with model: {model}"}
+                    return {"success": False, "message": f"Telnyx chat completion failed: {_telnyx_error_summary(chat_resp)}"}
+            except Exception as e:
+                logger.debug("Telnyx provider validation failed", error=str(e), exc_info=True)
+                return {"success": False, "message": f"Cannot connect to Telnyx at {base_url} (see server logs)"}
+
+        # ============================================================
+        # OPENAI-COMPATIBLE (OpenAI / Groq / OpenRouter / etc.) - validate /models
+        # ============================================================
+        if provider_type == 'openai':
+            chat_base_url = _safe_base_url(
+                provider_config.get('chat_base_url') or '', 'https://api.openai.com/v1'
+            )
             api_key = provider_config.get('api_key')
             if not api_key:
                 inferred_env = None
@@ -1047,9 +1428,11 @@ async def export_configuration():
         zip_buffer = io.BytesIO()
         
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            # Add YAML config
+            # Add YAML config (base + local override)
             if os.path.exists(settings.CONFIG_PATH):
                 zip_file.write(settings.CONFIG_PATH, 'ai-agent.yaml')
+            if os.path.exists(settings.LOCAL_CONFIG_PATH):
+                zip_file.write(settings.LOCAL_CONFIG_PATH, 'ai-agent.local.yaml')
             
             # Add ENV file
             if os.path.exists(settings.ENV_PATH):
@@ -1071,6 +1454,107 @@ async def export_configuration():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
+@router.post("/env/smtp/test")
+async def test_smtp_settings(req: SmtpTestRequest):
+    """
+    Send a test email using SMTP_* settings from the project's .env file.
+
+    This validates connectivity + auth using the *configured* SMTP settings (as saved by the UI),
+    even before the ai_engine container is force-recreated to pick up env_file changes.
+    """
+    try:
+        from dotenv import dotenv_values
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="python-dotenv is required for SMTP test") from e
+
+    if not (req.to_email or "").strip():
+        raise HTTPException(status_code=400, detail="to_email is required")
+
+    env_map = dotenv_values(settings.ENV_PATH) if os.path.exists(settings.ENV_PATH) else {}
+
+    host = str((req.smtp_host if req.smtp_host is not None else (env_map or {}).get("SMTP_HOST")) or "").strip()
+    if not host:
+        raise HTTPException(status_code=400, detail="SMTP_HOST is not set (save it in .env or pass smtp_host)")
+
+    tls_mode = str((req.smtp_tls_mode if req.smtp_tls_mode is not None else (env_map or {}).get("SMTP_TLS_MODE")) or "starttls").strip().lower()
+    if tls_mode not in {"starttls", "smtps", "none"}:
+        raise HTTPException(status_code=400, detail="SMTP_TLS_MODE must be starttls, smtps, or none")
+
+    port_raw = str((req.smtp_port if req.smtp_port is not None else (env_map or {}).get("SMTP_PORT")) or "").strip()
+    try:
+        port = int(port_raw) if port_raw else (465 if tls_mode == "smtps" else 587)
+    except Exception:
+        raise HTTPException(status_code=400, detail="SMTP_PORT must be an integer")
+
+    username = str((req.smtp_username if req.smtp_username is not None else (env_map or {}).get("SMTP_USERNAME")) or "").strip() or None
+    password = str((req.smtp_password if req.smtp_password is not None else (env_map or {}).get("SMTP_PASSWORD")) or "").strip() or None
+
+    timeout_raw = str((req.smtp_timeout_seconds if req.smtp_timeout_seconds is not None else (env_map or {}).get("SMTP_TIMEOUT_SECONDS")) or "10").strip()
+    try:
+        timeout_s = float(timeout_raw or "10")
+    except Exception:
+        timeout_s = 10.0
+
+    tls_verify_raw = req.smtp_tls_verify if req.smtp_tls_verify is not None else (env_map or {}).get("SMTP_TLS_VERIFY")
+    if isinstance(tls_verify_raw, bool):
+        tls_verify = tls_verify_raw
+    else:
+        tls_verify = str(tls_verify_raw or "true").strip().lower() in {"1", "true", "yes", "on"}
+    context = ssl.create_default_context()
+    if not tls_verify:
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+    from_email = (req.from_email or "").strip()
+    if not from_email:
+        # Best-effort default: many SMTP servers expect From to match the authenticated mailbox.
+        from_email = (username or "test@localhost")
+
+    subject = (req.subject or "").strip() or "Asterisk AI Voice Agent - SMTP Test"
+    text = (req.text or "").strip() or (
+        "This is a test email sent by the Admin UI to verify your SMTP settings.\n\n"
+        "If you received this, SMTP is configured correctly."
+    )
+
+    msg = EmailMessage()
+    msg["To"] = req.to_email.strip()
+    msg["From"] = from_email
+    msg["Subject"] = subject
+    msg.set_content(text)
+
+    def _send_sync() -> None:
+        if tls_mode == "smtps":
+            with smtplib.SMTP_SSL(host=host, port=port, timeout=timeout_s, context=context) as smtp:
+                smtp.ehlo()
+                if username and password:
+                    smtp.login(username, password)
+                smtp.send_message(msg, to_addrs=[req.to_email.strip()])
+            return
+
+        with smtplib.SMTP(host=host, port=port, timeout=timeout_s) as smtp:
+            smtp.ehlo()
+            if tls_mode == "starttls":
+                smtp.starttls(context=context)
+                smtp.ehlo()
+            if username and password:
+                smtp.login(username, password)
+            smtp.send_message(msg, to_addrs=[req.to_email.strip()])
+
+    try:
+        await asyncio.to_thread(_send_sync)
+        return {
+            "success": True,
+            "message": "Test email accepted by SMTP server",
+            "host": host,
+            "port": port,
+            "tls_mode": tls_mode,
+            "tls_verify": tls_verify,
+        }
+    except Exception as e:
+        # Do not echo secrets; only return the error string.
+        raise HTTPException(status_code=500, detail=f"SMTP test failed: {str(e)}")
+
 @router.get("/export-logs")
 async def export_logs():
     """Export logs and sanitized configuration for troubleshooting"""
@@ -1085,48 +1569,48 @@ async def export_logs():
         zip_buffer = io.BytesIO()
         
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            # 1. Sanitized YAML
-            if os.path.exists(settings.CONFIG_PATH):
-                try:
-                    import yaml
-                    with open(settings.CONFIG_PATH, 'r') as f:
-                        parsed = yaml.safe_load(f) or {}
+            # 1. Sanitized YAML (merged base + local override)
+            try:
+                import yaml
+                parsed = _read_merged_config_dict()
 
-                    import re
-                    email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
-                    # Pattern for hostnames that look like internal infrastructure
-                    hostname_pattern = re.compile(r'\b(?:pbx|sip|voip|trunk|asterisk)[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}\b', re.IGNORECASE)
-                    
-                    def redact(obj):
-                        if isinstance(obj, dict):
-                            out = {}
-                            for k, v in obj.items():
-                                key = str(k).lower()
-                                # Redact sensitive keys
-                                if any(s in key for s in ["api_key", "apikey", "token", "secret", "password", "pass", "key"]):
-                                    out[k] = "[REDACTED]"
-                                # Redact email fields
-                                elif "email" in key:
-                                    out[k] = "[EMAIL_REDACTED]"
-                                else:
-                                    out[k] = redact(v)
-                            return out
-                        if isinstance(obj, list):
-                            return [redact(v) for v in obj]
-                        # Redact email addresses and sensitive hostnames in string values
-                        if isinstance(obj, str):
-                            result = email_pattern.sub('[EMAIL_REDACTED]', obj)
-                            result = hostname_pattern.sub('[HOSTNAME_REDACTED]', result)
-                            return result
-                        return obj
+                import re
+                email_pattern = re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}')
+                # Pattern for hostnames that look like internal infrastructure
+                hostname_pattern = re.compile(r'\b(?:pbx|sip|voip|trunk|asterisk)[a-zA-Z0-9.-]*\.[a-zA-Z]{2,}\b', re.IGNORECASE)
+                
+                def redact(obj):
+                    if isinstance(obj, dict):
+                        out = {}
+                        for k, v in obj.items():
+                            key = str(k).lower()
+                            # Redact sensitive keys
+                            if any(s in key for s in ["api_key", "apikey", "token", "secret", "password", "pass", "key"]):
+                                out[k] = "[REDACTED]"
+                            # Redact email fields
+                            elif "email" in key:
+                                out[k] = "[EMAIL_REDACTED]"
+                            else:
+                                out[k] = redact(v)
+                        return out
+                    if isinstance(obj, list):
+                        return [redact(v) for v in obj]
+                    # Redact email addresses and sensitive hostnames in string values
+                    if isinstance(obj, str):
+                        result = email_pattern.sub('[EMAIL_REDACTED]', obj)
+                        result = hostname_pattern.sub('[HOSTNAME_REDACTED]', result)
+                        return result
+                    return obj
 
+                if parsed:
                     redacted = redact(parsed)
                     zip_file.writestr(
                         'ai-agent-sanitized.yaml',
                         yaml.safe_dump(redacted, sort_keys=False, default_flow_style=False),
                     )
-                except Exception:
-                    # Fallback: write raw if sanitization fails
+            except Exception:
+                # Fallback: write raw base if sanitization fails
+                if os.path.exists(settings.CONFIG_PATH):
                     with open(settings.CONFIG_PATH, 'r') as f:
                         zip_file.writestr('ai-agent-sanitized.yaml', f.read())
             
@@ -1229,9 +1713,9 @@ async def import_configuration(file: UploadFile = File(...)):
         # Create backups of current config
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         
-        if os.path.exists(settings.CONFIG_PATH):
-            backup_path = f"{settings.CONFIG_PATH}.bak.{timestamp}"
-            shutil.copy2(settings.CONFIG_PATH, backup_path)
+        if os.path.exists(settings.LOCAL_CONFIG_PATH):
+            backup_path = f"{settings.LOCAL_CONFIG_PATH}.bak.{timestamp}"
+            shutil.copy2(settings.LOCAL_CONFIG_PATH, backup_path)
             
         if os.path.exists(settings.ENV_PATH):
             backup_path = f"{settings.ENV_PATH}.bak.{timestamp}"
@@ -1240,12 +1724,16 @@ async def import_configuration(file: UploadFile = File(...)):
         with zipfile.ZipFile(zip_buffer, 'r') as zip_ref:
             # Check contents
             file_names = zip_ref.namelist()
-            if 'ai-agent.yaml' not in file_names and '.env' not in file_names:
-                raise HTTPException(status_code=400, detail="ZIP must contain ai-agent.yaml or .env")
+            if 'ai-agent.yaml' not in file_names and 'ai-agent.local.yaml' not in file_names and '.env' not in file_names:
+                raise HTTPException(status_code=400, detail="ZIP must contain ai-agent.yaml, ai-agent.local.yaml, or .env")
             
-            # Extract
-            if 'ai-agent.yaml' in file_names:
-                with open(settings.CONFIG_PATH, 'wb') as f:
+            # Extract: imported ai-agent.yaml content goes to the LOCAL override
+            # so the git-tracked base stays clean.
+            if 'ai-agent.local.yaml' in file_names:
+                with open(settings.LOCAL_CONFIG_PATH, 'wb') as f:
+                    f.write(zip_ref.read('ai-agent.local.yaml'))
+            elif 'ai-agent.yaml' in file_names:
+                with open(settings.LOCAL_CONFIG_PATH, 'wb') as f:
                     f.write(zip_ref.read('ai-agent.yaml'))
                     
             if '.env' in file_names:
@@ -1266,22 +1754,17 @@ def update_yaml_provider_field(provider_name: str, field: str, value: Any) -> bo
 
     This helper is used by model-management flows (local-ai sync).
 
-    Safety properties (aligned with update_yaml_config):
-    - Creates a timestamped backup and rotates old backups
-    - Validates resulting YAML against the canonical AppConfig schema
-    - Writes atomically (temp file + rename) and preserves file mode
+    Reads the merged config (base + local), applies the change, validates,
+    and writes the result to the LOCAL override file so the git-tracked
+    base stays clean.
     """
     try:
-        if not os.path.exists(settings.CONFIG_PATH):
+        base_config = _read_base_config_dict()
+        merged_config = _read_merged_config_dict()
+        if not merged_config:
             return False
 
-        with open(settings.CONFIG_PATH, 'r') as f:
-            config = _safe_load_no_duplicates(f.read())
-
-        if not isinstance(config, dict):
-            return False
-
-        providers = config.get('providers')
+        providers = merged_config.get('providers')
         if not isinstance(providers, dict):
             providers = {}
         provider_block = providers.get(provider_name)
@@ -1294,35 +1777,20 @@ def update_yaml_provider_field(provider_name: str, field: str, value: Any) -> bo
             provider_block[field] = value
 
         providers[provider_name] = provider_block
-        config['providers'] = providers
+        merged_config['providers'] = providers
 
-        content = yaml.dump(config, default_flow_style=False, sort_keys=False)
+        # Validate the fully-merged config, then persist only minimal local override
+        # so base defaults can continue to evolve across releases.
+        merged_content = yaml.dump(merged_config, default_flow_style=False, sort_keys=False)
 
         # Validate before writing
-        _validate_ai_agent_config(content)
+        _validate_ai_agent_config(merged_content)
 
-        # Backup + rotate
-        if os.path.exists(settings.CONFIG_PATH):
-            import datetime
-            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-            backup_path = f"{settings.CONFIG_PATH}.bak.{timestamp}"
-            with open(settings.CONFIG_PATH, 'r') as src:
-                with open(backup_path, 'w') as dst:
-                    dst.write(src.read())
-            _rotate_backups(settings.CONFIG_PATH)
+        local_override = _compute_local_override(base_config, merged_config)
+        content = yaml.dump(local_override, default_flow_style=False, sort_keys=False)
 
-        # Atomic write (preserve permissions)
-        dir_path = os.path.dirname(settings.CONFIG_PATH)
-        original_mode = os.stat(settings.CONFIG_PATH).st_mode if os.path.exists(settings.CONFIG_PATH) else None
-
-        with tempfile.NamedTemporaryFile('w', dir=dir_path, delete=False, suffix='.tmp') as tf:
-            tf.write(content)
-            temp_path = tf.name
-
-        if original_mode is not None:
-            os.chmod(temp_path, original_mode)
-
-        os.replace(temp_path, settings.CONFIG_PATH)
+        # Write to LOCAL override file
+        _write_local_config(content)
 
         return True
     except Exception as e:
@@ -1400,3 +1868,210 @@ async def get_provider_options(provider_type: str):
         return {"message": "Use /api/local-ai/models for dynamic local models"}
         
     return {"error": "Unknown provider type"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vertex AI Service Account JSON Management
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Store in project secrets dir - Admin UI has write access, ai_engine mounts it
+VERTEX_CREDENTIALS_PATH = "/app/project/secrets/gcp-service-account.json"
+VERTEX_REGIONS = [
+    {"value": "us-central1", "label": "US Central (Iowa)"},
+    {"value": "us-east1", "label": "US East (South Carolina)"},
+    {"value": "us-east4", "label": "US East (Northern Virginia)"},
+    {"value": "us-west1", "label": "US West (Oregon)"},
+    {"value": "us-west4", "label": "US West (Las Vegas)"},
+    {"value": "europe-west1", "label": "Europe West (Belgium)"},
+    {"value": "europe-west2", "label": "Europe West (London)"},
+    {"value": "europe-west3", "label": "Europe West (Frankfurt)"},
+    {"value": "europe-west4", "label": "Europe West (Netherlands)"},
+    {"value": "asia-east1", "label": "Asia East (Taiwan)"},
+    {"value": "asia-northeast1", "label": "Asia Northeast (Tokyo)"},
+    {"value": "asia-southeast1", "label": "Asia Southeast (Singapore)"},
+    {"value": "australia-southeast1", "label": "Australia (Sydney)"},
+]
+
+
+@router.get("/vertex-ai/regions")
+async def get_vertex_regions():
+    """Return available Vertex AI regions."""
+    return {"regions": VERTEX_REGIONS}
+
+
+@router.get("/vertex-ai/credentials")
+async def get_vertex_credentials_status():
+    """Check if Vertex AI credentials are uploaded and return metadata."""
+    import json
+    
+    if not os.path.exists(VERTEX_CREDENTIALS_PATH):
+        return {
+            "uploaded": False,
+            "filename": None,
+            "project_id": None,
+            "client_email": None,
+            "uploaded_at": None,
+        }
+    
+    try:
+        stat = os.stat(VERTEX_CREDENTIALS_PATH)
+        with open(VERTEX_CREDENTIALS_PATH, 'r') as f:
+            creds = json.load(f)
+        
+        return {
+            "uploaded": True,
+            "filename": "gcp-service-account.json",
+            "project_id": creds.get("project_id"),
+            "client_email": creds.get("client_email"),
+            "uploaded_at": stat.st_mtime,
+        }
+    except Exception as e:
+        logger.error(f"Error reading Vertex AI credentials: {e}")
+        return {
+            "uploaded": True,
+            "filename": "gcp-service-account.json",
+            "project_id": None,
+            "client_email": None,
+            "error": "Failed to read credentials file",
+        }
+
+
+@router.post("/vertex-ai/credentials")
+async def upload_vertex_credentials(file: UploadFile = File(...)):
+    """Upload a GCP service account JSON file for Vertex AI authentication."""
+    import json
+    
+    if not file.filename or not file.filename.endswith('.json'):
+        raise HTTPException(status_code=400, detail="File must be a JSON file")
+    
+    try:
+        content = await file.read()
+        # Validate JSON structure
+        creds = json.loads(content)
+        
+        required_fields = ["type", "project_id", "private_key", "client_email"]
+        missing = [f for f in required_fields if f not in creds]
+        if missing:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid service account JSON. Missing fields: {', '.join(missing)}"
+            )
+        
+        if creds.get("type") != "service_account":
+            raise HTTPException(
+                status_code=400,
+                detail="JSON file must be a service account key (type: service_account)"
+            )
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(VERTEX_CREDENTIALS_PATH), exist_ok=True)
+        
+        # Write atomically
+        temp_path = VERTEX_CREDENTIALS_PATH + ".tmp"
+        with open(temp_path, 'wb') as f:
+            f.write(content)
+        os.chmod(temp_path, 0o600)  # Restrict permissions
+        os.replace(temp_path, VERTEX_CREDENTIALS_PATH)
+        
+        # Auto-upsert GOOGLE_APPLICATION_CREDENTIALS in .env so the env var
+        # persists across container recreates.  The container mount path is
+        # /app/project/secrets/gcp-service-account.json (see docker-compose.yml).
+        try:
+            _upsert_env_key("GOOGLE_APPLICATION_CREDENTIALS", "/app/project/secrets/gcp-service-account.json")
+        except Exception:
+            logger.warning("Could not auto-set GOOGLE_APPLICATION_CREDENTIALS in .env")
+
+        logger.info(f"Vertex AI credentials uploaded: project={creds.get('project_id')}")
+        
+        return {
+            "status": "success",
+            "message": "Service account JSON uploaded successfully",
+            "project_id": creds.get("project_id"),
+            "client_email": creds.get("client_email"),
+        }
+        
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON file")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading Vertex AI credentials: {e}")
+        raise HTTPException(status_code=500, detail="Failed to upload credentials")
+
+
+@router.delete("/vertex-ai/credentials")
+async def delete_vertex_credentials():
+    """Delete the uploaded Vertex AI credentials file."""
+    if not os.path.exists(VERTEX_CREDENTIALS_PATH):
+        raise HTTPException(status_code=404, detail="No credentials file found")
+    
+    try:
+        os.remove(VERTEX_CREDENTIALS_PATH)
+        logger.info("Vertex AI credentials deleted")
+        return {"status": "success", "message": "Credentials deleted"}
+    except Exception as e:
+        logger.error(f"Error deleting Vertex AI credentials: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete credentials")
+
+
+@router.post("/vertex-ai/verify")
+async def verify_vertex_credentials():
+    """Verify Vertex AI credentials by attempting to get an access token."""
+    import json
+    
+    if not os.path.exists(VERTEX_CREDENTIALS_PATH):
+        raise HTTPException(status_code=400, detail="No credentials file uploaded")
+    
+    try:
+        # Try to use google-auth to verify credentials
+        import asyncio
+        from google.oauth2 import service_account
+        from google.auth.transport.requests import Request
+        
+        def _refresh_credentials():
+            """Blocking credential refresh - run in thread to avoid blocking event loop."""
+            creds = service_account.Credentials.from_service_account_file(
+                VERTEX_CREDENTIALS_PATH,
+                scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            creds.refresh(Request())
+            return creds
+        
+        # Run blocking credential refresh in thread pool
+        credentials = await asyncio.to_thread(_refresh_credentials)
+        
+        # Read project info
+        with open(VERTEX_CREDENTIALS_PATH, 'r') as f:
+            creds_data = json.load(f)
+        
+        return {
+            "status": "success",
+            "message": "Credentials verified successfully",
+            "project_id": creds_data.get("project_id"),
+            "client_email": creds_data.get("client_email"),
+            "token_expiry": credentials.expiry.isoformat() if credentials.expiry else None,
+        }
+        
+    except ImportError:
+        # google-auth not installed in admin_ui - just validate JSON structure
+        try:
+            with open(VERTEX_CREDENTIALS_PATH, 'r') as f:
+                creds_data = json.load(f)
+            
+            required = ["type", "project_id", "private_key", "client_email"]
+            if all(k in creds_data for k in required):
+                return {
+                    "status": "success",
+                    "message": "Credentials file structure is valid (full verification requires google-auth)",
+                    "project_id": creds_data.get("project_id"),
+                    "client_email": creds_data.get("client_email"),
+                    "warning": "Install google-auth for full token verification",
+                }
+            else:
+                raise HTTPException(status_code=400, detail="Invalid credentials structure")
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="Invalid JSON in credentials file")
+            
+    except Exception as e:
+        logger.error(f"Error verifying Vertex AI credentials: {e}")
+        raise HTTPException(status_code=400, detail="Verification failed - check credentials are valid")

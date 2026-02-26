@@ -51,7 +51,7 @@ Implemented full tool execution support for modular pipelines (local_hybrid, cus
 - **Call 1763582133.6224**: Hangup + transcript email ✅
   - User: "Goodbye"
   - Tool 1: hangup_call with farewell
-  - Tool 2: request_transcript to haider.til@gmail.com
+  - Tool 2: request_transcript to caller@example.com
   - Tool 3: send_email_summary (auto-trigger)
   - Result: All three tools executed successfully
 
@@ -222,7 +222,7 @@ pipelines:
 
 ## Success Criteria
 
-- ✅ local_hybrid executes transfer_call
+- ✅ local_hybrid executes blind_transfer
 - ✅ local_hybrid executes hangup_call
 - ✅ local_hybrid executes send_email_summary
 - ✅ local_hybrid executes request_transcript

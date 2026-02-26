@@ -8,21 +8,11 @@ DEFAULT_HANGUP_MARKERS: Dict[str, List[str]] = {
         "no transcript",
         "no transcript needed",
         "don't send a transcript",
-        "do not send a transcript",
-        "no need for a transcript",
         "no thanks",
-        "no thank you",
         "that's all",
-        "that is all",
-        "that's it",
-        "that is it",
         "nothing else",
-        "all set",
-        "all good",
-        "end the call",
         "end call",
         "hang up",
-        "hangup",
         "goodbye",
         "bye",
     ],
@@ -30,12 +20,8 @@ DEFAULT_HANGUP_MARKERS: Dict[str, List[str]] = {
         "goodbye",
         "bye",
         "thank you for calling",
-        "thanks for calling",
         "have a great day",
-        "have a good day",
         "take care",
-        "ending the call",
-        "i'll let you go",
     ],
     "affirmative": [
         "yes",
@@ -167,7 +153,7 @@ def text_contains_marker(text: str, markers: Iterable[str]) -> bool:
                 return True
             continue
         # Single-word markers should match whole words to avoid false positives (e.g., "no" in "notification").
-        if re.search(rf"(?:^|\\b){re.escape(m)}(?:\\b|$)", t):
+        if re.search(rf"(?:^|\b){re.escape(m)}(?:\b|$)", t):
             return True
     return False
 
@@ -177,6 +163,6 @@ def text_contains_marker_word(text: str, markers: Iterable[str]) -> bool:
     if not t:
         return False
     for m in markers:
-        if re.search(rf"(?:^|\\b){re.escape(m)}(?:\\b|$)", t):
+        if re.search(rf"(?:^|\b){re.escape(m)}(?:\b|$)", t):
             return True
     return False

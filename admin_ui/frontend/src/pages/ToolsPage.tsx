@@ -1,7 +1,9 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import axios from 'axios';
+import { toast } from 'sonner';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
 import yaml from 'js-yaml';
-import { Save, AlertCircle, RefreshCw, Loader2, Phone, Webhook, Search } from 'lucide-react';
+import { Save, AlertCircle, RefreshCw, Loader2, Phone, Webhook, Search, BookOpen, ChevronDown, ChevronRight } from 'lucide-react';
 import { YamlErrorBanner, YamlErrorInfo } from '../components/ui/YamlErrorBanner';
 import { ConfigSection } from '../components/ui/ConfigSection';
 import { ConfigCard } from '../components/ui/ConfigCard';
@@ -10,21 +12,87 @@ import HTTPToolForm from '../components/config/HTTPToolForm';
 import { useAuth } from '../auth/AuthContext';
 import { sanitizeConfigForSave } from '../utils/configSanitizers';
 
-type ToolPhase = 'in_call' | 'pre_call' | 'post_call';
+type ToolPhase = 'in_call' | 'pre_call' | 'post_call' | 'catalog';
+
+type ToolParam = {
+    name: string;
+    type: string;
+    description: string;
+    required?: boolean;
+};
+
+type ToolDef = {
+    name: string;
+    description: string;
+    category?: string;
+    phase?: string;
+    is_global?: boolean;
+    source?: 'builtin' | 'http' | 'mcp' | 'unknown' | string;
+    parameters?: ToolParam[];
+};
 
 const ToolsPage = () => {
+    const { confirm } = useConfirmDialog();
     const { token } = useAuth();
     const [config, setConfig] = useState<any>({});
+    const configRef = useRef<any>({});
     const [loading, setLoading] = useState(true);
     const [yamlError, setYamlError] = useState<YamlErrorInfo | null>(null);
     const [saving, setSaving] = useState(false);
     const [pendingRestart, setPendingRestart] = useState(false);
     const [restartingEngine, setRestartingEngine] = useState(false);
     const [activePhase, setActivePhase] = useState<ToolPhase>('in_call');
+    const [toolCatalog, setToolCatalog] = useState<ToolDef[]>([]);
+    const [toolCatalogError, setToolCatalogError] = useState<string | null>(null);
+    const [toolCatalogLoading, setToolCatalogLoading] = useState(false);
+    const [toolCatalogQuery, setToolCatalogQuery] = useState('');
+    const [toolCatalogExpanded, setToolCatalogExpanded] = useState<Record<string, boolean>>({});
+
+    const hangupUsage = useMemo(() => {
+        const providers = (config && typeof config === 'object') ? (config as any).providers : null;
+        const googleLiveMarkersEnabledRaw = providers?.google_live?.hangup_markers_enabled;
+        const googleLiveMarkersEnabled =
+            googleLiveMarkersEnabledRaw === true ? true : googleLiveMarkersEnabledRaw === false ? false : null;
+
+        const pipelines = (config && typeof config === 'object') ? (config as any).pipelines : null;
+        const pipelineEndCallOverrides: string[] = [];
+        const pipelineModeOverrides: { name: string; mode: string }[] = [];
+        const pipelineGuardrailOverrides: { name: string; enabled: boolean }[] = [];
+
+        if (pipelines && typeof pipelines === 'object' && !Array.isArray(pipelines)) {
+            Object.entries(pipelines).forEach(([name, pipeline]) => {
+                const llmOpts = (pipeline as any)?.options?.llm;
+                const end = llmOpts?.hangup_call_guardrail_markers?.end_call;
+                if (Array.isArray(end) && end.length > 0) {
+                    pipelineEndCallOverrides.push(name);
+                }
+                const mode = String(llmOpts?.hangup_call_guardrail_mode || '').trim();
+                if (mode) {
+                    pipelineModeOverrides.push({ name, mode });
+                }
+                const enabled = llmOpts?.hangup_call_guardrail;
+                if (enabled === true || enabled === false) {
+                    pipelineGuardrailOverrides.push({ name, enabled });
+                }
+            });
+        }
+
+        return {
+            googleLiveMarkersEnabled,
+            pipelineEndCallOverrides,
+            pipelineModeOverrides,
+            pipelineGuardrailOverrides,
+        };
+    }, [config]);
 
     useEffect(() => {
         fetchConfig();
+        fetchToolCatalog();
     }, []);
+
+    useEffect(() => {
+        configRef.current = config;
+    }, [config]);
 
     const fetchConfig = async () => {
         try {
@@ -45,23 +113,44 @@ const ToolsPage = () => {
         }
     };
 
-    const handleSave = async () => {
+    const fetchToolCatalog = async () => {
+        setToolCatalogLoading(true);
+        try {
+            const res = await axios.get('/api/tools/catalog');
+            const tools = (res.data && Array.isArray(res.data.tools)) ? res.data.tools : [];
+            setToolCatalog(tools);
+            setToolCatalogError(null);
+        } catch (err: any) {
+            console.error('Failed to load tool catalog', err);
+            setToolCatalog([]);
+            setToolCatalogError(err?.response?.data?.detail || err?.message || 'Failed to load tool catalog');
+        } finally {
+            setToolCatalogLoading(false);
+        }
+    };
+
+    const persistConfigNow = async (nextConfig: any, successToast?: string) => {
         setSaving(true);
         try {
-            const sanitized = sanitizeConfigForSave(config);
+            const sanitized = sanitizeConfigForSave(nextConfig);
             await axios.post('/api/config/yaml', { content: yaml.dump(sanitized) }, {
                 headers: { Authorization: `Bearer ${token}` },
                 timeout: 30000  // 30 second timeout
             });
             setPendingRestart(true);
-            alert('Tools configuration saved successfully');
+            if (successToast) toast.success(successToast);
         } catch (err: any) {
             console.error('Failed to save config', err);
             const detail = err.response?.data?.detail || err.message || 'Unknown error';
-            alert(`Failed to save configuration: ${detail}`);
+            toast.error('Failed to save configuration', { description: detail });
+            throw err;
         } finally {
             setSaving(false);
         }
+    };
+
+    const handleSave = async () => {
+        await persistConfigNow(configRef.current, 'Tools configuration saved');
     };
 
     const handleRestartAIEngine = async (force: boolean = false) => {
@@ -72,9 +161,12 @@ const ToolsPage = () => {
             });
 
             if (response.data.status === 'warning') {
-                const confirmForce = window.confirm(
-                    `${response.data.message}\n\nDo you want to force restart anyway? This may disconnect active calls.`
-                );
+                const confirmForce = await confirm({
+                    title: 'Force Restart?',
+                    description: `${response.data.message}\n\nDo you want to force restart anyway? This may disconnect active calls.`,
+                    confirmText: 'Force Restart',
+                    variant: 'destructive'
+                });
                 if (confirmForce) {
                     setRestartingEngine(false);
                     return handleRestartAIEngine(true);
@@ -83,20 +175,20 @@ const ToolsPage = () => {
             }
 
             if (response.data.status === 'degraded') {
-                alert(`AI Engine restarted but may not be fully healthy: ${response.data.output || 'Health check issue'}\n\nPlease verify manually.`);
+                toast.warning('AI Engine restarted but may not be fully healthy', { description: response.data.output || 'Please verify manually' });
                 return;
             }
 
             setPendingRestart(false);
-            alert('AI Engine restarted! Changes are now active.');
+            toast.success('AI Engine restarted! Changes are now active.');
         } catch (error: any) {
-            alert(`Failed to restart AI Engine: ${error.response?.data?.detail || error.message}`);
+            toast.error('Failed to restart AI Engine', { description: error.response?.data?.detail || error.message });
         } finally {
             setRestartingEngine(false);
         }
     };
 
-    const updateToolsConfig = (newToolsConfig: any) => {
+    const mergeToolsConfig = (baseConfig: any, newToolsConfig: any) => {
         // Extract root-level settings that should not be nested under tools
         const { farewell_hangup_delay_sec, ...toolsOnly } = newToolsConfig;
 
@@ -104,9 +196,9 @@ const ToolsPage = () => {
         // This prevents silent config loss of custom/unknown tool entries.
         // Built-in tools that ToolForm manages: transfer, hangup_call, leave_voicemail, 
         // send_email_summary, request_transcript
-        const builtInToolKeys = ['transfer', 'attended_transfer', 'cancel_transfer', 'hangup_call', 'leave_voicemail', 'send_email_summary', 'request_transcript'];
+        const builtInToolKeys = ['transfer', 'attended_transfer', 'cancel_transfer', 'hangup_call', 'leave_voicemail', 'send_email_summary', 'request_transcript', 'google_calendar'];
         
-        const existingTools = config.tools || {};
+        const existingTools = baseConfig.tools || {};
         const preservedTools: Record<string, any> = {};
         
         Object.entries(existingTools).forEach(([k, v]) => {
@@ -125,11 +217,21 @@ const ToolsPage = () => {
         });
 
         // Update both tools config and root-level farewell_hangup_delay_sec
-        const updatedConfig = { ...config, tools: { ...preservedTools, ...toolsOnly } };
+        const updatedConfig = { ...baseConfig, tools: { ...preservedTools, ...toolsOnly } };
         if (farewell_hangup_delay_sec !== undefined) {
             updatedConfig.farewell_hangup_delay_sec = farewell_hangup_delay_sec;
         }
-        setConfig(updatedConfig);
+        return updatedConfig;
+    };
+
+    const updateToolsConfig = (newToolsConfig: any) => {
+        setConfig((prev: any) => mergeToolsConfig(prev, newToolsConfig));
+    };
+
+    const updateToolsConfigAndSaveNow = async (newToolsConfig: any) => {
+        const nextConfig = mergeToolsConfig(configRef.current, newToolsConfig);
+        setConfig(nextConfig);
+        await persistConfigNow(nextConfig);
     };
 
     if (loading) return <div className="p-8 text-center text-muted-foreground">Loading configuration...</div>;
@@ -230,6 +332,17 @@ const ToolsPage = () => {
                         <Webhook className="w-4 h-4" />
                         Post-Call
                     </button>
+                    <button
+                        onClick={() => setActivePhase('catalog')}
+                        className={`flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
+                            activePhase === 'catalog'
+                                ? 'border-primary text-primary'
+                                : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
+                        }`}
+                    >
+                        <BookOpen className="w-4 h-4" />
+                        Catalog
+                    </button>
                 </div>
             </div>
 
@@ -257,7 +370,10 @@ const ToolsPage = () => {
                         <ConfigCard>
                             <ToolForm
                                 config={{ ...(config.tools || {}), farewell_hangup_delay_sec: config.farewell_hangup_delay_sec }}
+                                contexts={config.contexts || {}}
+                                hangupUsage={hangupUsage}
                                 onChange={updateToolsConfig}
+                                onSaveNow={updateToolsConfigAndSaveNow}
                             />
                         </ConfigCard>
                     </ConfigSection>
@@ -290,6 +406,167 @@ const ToolsPage = () => {
                             phase="post_call"
                             contexts={config.contexts}
                         />
+                    </ConfigCard>
+                </ConfigSection>
+            )}
+
+            {activePhase === 'catalog' && (
+                <ConfigSection
+                    title="Tool Catalog (Read-only)"
+                    description="Reference for all tools currently registered in the AI Engine, including built-in, HTTP, and MCP tools. This does not change tool behavior."
+                >
+                    <ConfigCard>
+                        <div className="space-y-4">
+                            <div className="flex flex-col md:flex-row md:items-center gap-3">
+                                <div className="flex-1 relative">
+                                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
+                                    <input
+                                        type="text"
+                                        className="w-full pl-10 pr-3 py-2 rounded border border-input bg-background text-sm"
+                                        placeholder="Search tools (name, description, phase, source)"
+                                        value={toolCatalogQuery}
+                                        onChange={(e) => setToolCatalogQuery(e.target.value)}
+                                    />
+                                </div>
+                                <button
+                                    type="button"
+                                    onClick={fetchToolCatalog}
+                                    disabled={toolCatalogLoading}
+                                    className="inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 border border-input bg-background shadow-sm hover:bg-accent hover:text-accent-foreground h-9 px-4 py-2"
+                                >
+                                    {toolCatalogLoading ? (
+                                        <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                    ) : (
+                                        <RefreshCw className="w-4 h-4 mr-2" />
+                                    )}
+                                    Refresh
+                                </button>
+                            </div>
+
+                            {toolCatalogError && (
+                                <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-sm text-red-700 dark:text-red-400">
+                                    {toolCatalogError}
+                                </div>
+                            )}
+
+                            <div className="overflow-x-auto border border-border rounded-md">
+                                <table className="w-full text-sm">
+                                    <thead className="bg-secondary/40 text-muted-foreground">
+                                        <tr>
+                                            <th className="text-left px-3 py-2 w-10"></th>
+                                            <th className="text-left px-3 py-2">Tool</th>
+                                            <th className="text-left px-3 py-2">Phase</th>
+                                            <th className="text-left px-3 py-2">Source</th>
+                                            <th className="text-left px-3 py-2">Description</th>
+                                            <th className="text-left px-3 py-2 w-16">Params</th>
+                                        </tr>
+                                    </thead>
+                                    <tbody>
+                                        {(() => {
+                                            const q = toolCatalogQuery.trim().toLowerCase();
+                                            const filtered = (toolCatalog || [])
+                                                .filter((t) => {
+                                                    if (!q) return true;
+                                                    const hay = [
+                                                        t.name,
+                                                        t.description,
+                                                        t.phase,
+                                                        t.source,
+                                                        t.category,
+                                                    ]
+                                                        .filter(Boolean)
+                                                        .join(' ')
+                                                        .toLowerCase();
+                                                    return hay.includes(q);
+                                                })
+                                                .sort((a, b) => a.name.localeCompare(b.name));
+
+                                            if (toolCatalogLoading && filtered.length === 0) {
+                                                return (
+                                                    <tr>
+                                                        <td className="px-3 py-3" colSpan={6}>
+                                                            <div className="flex items-center text-muted-foreground">
+                                                                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                                                Loading tool catalog...
+                                                            </div>
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            }
+
+                                            if (filtered.length === 0) {
+                                                return (
+                                                    <tr>
+                                                        <td className="px-3 py-3 text-muted-foreground" colSpan={6}>
+                                                            No tools match this search.
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            }
+
+                                            return filtered.flatMap((t) => {
+                                                const expanded = !!toolCatalogExpanded[t.name];
+                                                const params = Array.isArray(t.parameters) ? t.parameters : [];
+                                                return [
+                                                    (
+                                                        <tr key={t.name} className="border-t border-border align-top">
+                                                            <td className="px-3 py-2">
+                                                                <button
+                                                                    type="button"
+                                                                    className="text-muted-foreground hover:text-foreground"
+                                                                    onClick={() => setToolCatalogExpanded((prev) => ({ ...prev, [t.name]: !expanded }))}
+                                                                    aria-label={expanded ? 'Collapse tool details' : 'Expand tool details'}
+                                                                >
+                                                                    {expanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
+                                                                </button>
+                                                            </td>
+                                                            <td className="px-3 py-2 font-medium text-foreground whitespace-nowrap">
+                                                                {t.name}
+                                                                {t.is_global ? (
+                                                                    <span className="ml-2 text-[10px] px-1.5 py-0.5 rounded border border-border bg-secondary/40 text-muted-foreground">
+                                                                        global
+                                                                    </span>
+                                                                ) : null}
+                                                            </td>
+                                                            <td className="px-3 py-2 text-muted-foreground whitespace-nowrap">{t.phase || '-'}</td>
+                                                            <td className="px-3 py-2 text-muted-foreground whitespace-nowrap">{t.source || 'unknown'}</td>
+                                                            <td className="px-3 py-2 text-foreground/90">{t.description || '-'}</td>
+                                                            <td className="px-3 py-2 text-muted-foreground text-right">{params.length}</td>
+                                                        </tr>
+                                                    ),
+                                                    expanded ? (
+                                                        <tr key={`${t.name}-details`} className="border-t border-border bg-secondary/20">
+                                                            <td className="px-3 py-2" colSpan={6}>
+                                                                {params.length === 0 ? (
+                                                                    <div className="text-xs text-muted-foreground">No parameters.</div>
+                                                                ) : (
+                                                                    <div className="space-y-2">
+                                                                        <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Parameters</div>
+                                                                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                                                                            {params.map((p) => (
+                                                                                <div key={`${t.name}-${p.name}`} className="rounded border border-border bg-background/60 p-2">
+                                                                                    <div className="flex items-center justify-between">
+                                                                                        <div className="text-xs font-medium text-foreground">
+                                                                                            {p.name}{p.required ? <span className="ml-1 text-red-500">*</span> : null}
+                                                                                        </div>
+                                                                                        <div className="text-[10px] text-muted-foreground">{p.type}</div>
+                                                                                    </div>
+                                                                                    <div className="text-xs text-muted-foreground mt-1">{p.description || '-'}</div>
+                                                                                </div>
+                                                                            ))}
+                                                                        </div>
+                                                                    </div>
+                                                                )}
+                                                            </td>
+                                                        </tr>
+                                                    ) : null,
+                                                ].filter(Boolean) as any;
+                                            });
+                                        })()}
+                                    </tbody>
+                                </table>
+                            </div>
+                        </div>
                     </ConfigCard>
                 </ConfigSection>
             )}

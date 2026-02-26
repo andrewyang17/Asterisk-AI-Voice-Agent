@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { AlertCircle, ArrowRight, Loader2, Cloud, Server, Shield, Zap, SkipForward, CheckCircle, CheckCircle2, XCircle, Terminal, Copy, HardDrive, Play, RefreshCw, Info, AlertTriangle } from 'lucide-react';
 import axios from 'axios';
+import { useConfirmDialog } from '../hooks/useConfirmDialog';
 
 interface SetupConfig {
     provider: string;
@@ -52,6 +53,7 @@ type LocalModelsStatus = {
 
 const Wizard = () => {
     const navigate = useNavigate();
+    const { confirm } = useConfirmDialog();
     const [step, setStep] = useState(1);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -112,6 +114,27 @@ const Wizard = () => {
 
     // Check if hostname is being used (requires server IP for RTP security)
     const isUsingHostname = !isIPAddress(config.asterisk_host) && config.asterisk_host !== 'localhost';
+
+    const getDialplanProviderOverride = (provider: string): string => {
+        const supported = new Set([
+            'google_live',
+            'openai_realtime',
+            'deepgram',
+            'local_hybrid',
+            'local',
+            'elevenlabs_agent',
+        ]);
+        return supported.has(provider) ? provider : 'openai_realtime';
+    };
+    const dialplanContextOverride = 'default';
+    const dialplanProviderOverride = getDialplanProviderOverride(config.provider);
+    const nonLocalDialplanSnippet = `; extensions_custom.conf
+[from-ai-agent]
+exten => s,1,NoOp(AI Agent Call)
+ same => n,Set(AI_CONTEXT=${dialplanContextOverride})
+ same => n,Set(AI_PROVIDER=${dialplanProviderOverride})
+ same => n,Stasis(asterisk-ai-voice-agent)
+ same => n,Hangup()`;
 
     const showToast = (message: string, type: 'success' | 'error' | 'warning') => {
         setToast({ message, type });
@@ -338,7 +361,7 @@ const Wizard = () => {
             if (!res.data.valid) {
                 throw new Error(res.data.error || 'Connection failed');
             }
-            alert(res.data.message || 'Successfully connected to Asterisk!');
+            showToast(res.data.message || 'Successfully connected to Asterisk!', 'success');
         } catch (err: any) {
             setError('Connection failed: ' + (err.response?.data?.error || err.message));
         } finally {
@@ -423,10 +446,19 @@ const Wizard = () => {
 
         setLocalAIStatus((prev) => ({ ...prev, serverStarted: true, serverReady: false, serverLogs: ['Starting container...'] }));
 
+        let isBuilding = false;
         try {
             const res = await axios.post('/api/wizard/local/start-server');
             if (!res.data.success) {
                 throw new Error(res.data.message || 'Failed to start local_ai_server');
+            }
+            // AAVA-177: Backend signals when a full image build was kicked off
+            isBuilding = !!res.data.building;
+            if (isBuilding) {
+                setLocalAIStatus((prev) => ({
+                    ...prev,
+                    serverLogs: ['Building Docker image (this can take 10-60 minutes for GPU builds)...'],
+                }));
             }
         } catch (err: any) {
             setLocalAIStatus((prev) => ({ ...prev, serverStarted: false, serverReady: false }));
@@ -435,11 +467,14 @@ const Wizard = () => {
             setStartingLocalServer(false);
         }
 
+        // AAVA-177: Use 60-minute timeout for image builds, 2-minute for normal starts
+        const pollTimeoutMs = isBuilding ? 3_600_000 : 120_000;
+
         const pollLogs = async () => {
             if (localServerPollRef.current.cancelled) return;
             const startedAt = localServerPollRef.current.startedAt || Date.now();
             const elapsed = Date.now() - startedAt;
-            if (elapsed >= 120_000) return;
+            if (elapsed >= pollTimeoutMs) return;
             try {
                 const logRes = await axios.get('/api/wizard/local/server-logs');
                 if (!localServerPollRef.current.cancelled) {
@@ -504,7 +539,9 @@ const Wizard = () => {
                 llm: config.local_llm_model || pickRecommendedLlmId(),
                 tts: config.local_tts_backend,
                 kroko_embedded: config.kroko_embedded,
+                kroko_api_key: config.kroko_api_key,
                 kokoro_mode: config.kokoro_mode,
+                kokoro_voice: config.kokoro_voice,
                 language: selectedLanguage,
                 stt_model_id: config.local_stt_model,
                 tts_model_id: config.local_tts_model,
@@ -759,7 +796,6 @@ const Wizard = () => {
                             provider: 'google',
                             api_key: config.google_key
                         });
-                        if (!res.data.valid) throw new Error(`Google Key Invalid: ${res.data.error}`);
                         if (!res.data.valid) throw new Error(`Google Key Invalid: ${res.data.error}`);
                     } else {
                         throw new Error('Google API Key is required for Google Live provider');
@@ -1467,26 +1503,32 @@ const Wizard = () => {
                         )}
 
                         {config.provider === 'google_live' && (
-                            <div className="space-y-2">
-                                <label className="text-sm font-medium">Google API Key</label>
-                                <div className="flex space-x-2">
-                                    <input
-                                        type="password"
-                                        className="w-full p-2 rounded-md border border-input bg-background"
-                                        value={config.google_key}
-                                        onChange={e => setConfig({ ...config, google_key: e.target.value })}
-                                        placeholder="AIza..."
-                                    />
-                                    <button
-                                        type="button"
-                                        onClick={() => handleTestKey('google', config.google_key || '')}
-                                        className="px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80"
-                                        disabled={loading}
-                                    >
-                                        Test
-                                    </button>
+                            <div className="space-y-4">
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium">Google API Key</label>
+                                    <div className="flex space-x-2">
+                                        <input
+                                            type="password"
+                                            className="w-full p-2 rounded-md border border-input bg-background"
+                                            value={config.google_key}
+                                            onChange={e => setConfig({ ...config, google_key: e.target.value })}
+                                            placeholder="AIza..."
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={() => handleTestKey('google', config.google_key || '')}
+                                            className="px-3 py-2 rounded-md bg-secondary text-secondary-foreground hover:bg-secondary/80"
+                                            disabled={loading}
+                                        >
+                                            Test
+                                        </button>
+                                    </div>
+                                    <p className="text-xs text-muted-foreground">Required for Google Gemini Live provider.</p>
                                 </div>
-                                <p className="text-xs text-muted-foreground">Required for Google Gemini Live provider.</p>
+                                <div className="bg-blue-50/50 dark:bg-blue-900/10 p-3 rounded-md border border-blue-100 dark:border-blue-900/20 text-xs text-blue-700 dark:text-blue-400">
+                                    <p className="font-semibold mb-1">Using Google Cloud / Vertex AI?</p>
+                                    <p>For enterprise GCP deployments, Vertex AI offers GA models with improved function calling reliability. Configure Vertex AI via the <strong>Providers page</strong> after setup — it uses service account authentication instead of an API key.</p>
+                                </div>
                             </div>
                         )}
 
@@ -1542,16 +1584,16 @@ const Wizard = () => {
                                     <p className="text-xs text-muted-foreground">Required for ElevenLabs Conversational provider.</p>
                                 </div>
 
-                                <div className="bg-amber-50/50 dark:bg-amber-900/10 p-4 rounded-md border border-amber-100 dark:border-amber-900/20">
-                                    <h4 className="font-semibold mb-2 text-amber-800 dark:text-amber-300 text-sm">Setup Requirements</h4>
-                                    <ul className="text-xs text-amber-700 dark:text-amber-400 space-y-1 list-disc list-inside">
-                                        <li>Create an agent at elevenlabs.io/app/agents</li>
-                                        <li>Enable "Require authentication" in security settings</li>
-                                        <li>Add client tools (hangup_call, transfer_call, etc.)</li>
-                                    </ul>
-                                </div>
-                            </div>
-                        )}
+                                        <div className="bg-amber-50/50 dark:bg-amber-900/10 p-4 rounded-md border border-amber-100 dark:border-amber-900/20">
+                                            <h4 className="font-semibold mb-2 text-amber-800 dark:text-amber-300 text-sm">Setup Requirements</h4>
+                                            <ul className="text-xs text-amber-700 dark:text-amber-400 space-y-1 list-disc list-inside">
+                                                <li>Create an agent at elevenlabs.io/app/agents</li>
+                                                <li>Enable "Require authentication" in security settings</li>
+                                                <li>Add client tools (hangup_call, blind_transfer, etc.)</li>
+                                            </ul>
+                                        </div>
+                                    </div>
+                                )}
 
                         {config.provider === 'local' && (
                             <div className="space-y-6">
@@ -2161,12 +2203,12 @@ const Wizard = () => {
                                         try {
                                             const res = await axios.get('/api/system/health');
                                             if (res.data.local_ai_server?.status === 'connected') {
-                                                alert('Local AI Server is running and connected!');
+                                                showToast('Local AI Server is running and connected!', 'success');
                                             } else {
-                                                alert(`Local AI Server is NOT connected. Status: ${res.data.local_ai_server?.status}`);
+                                                showToast(`Local AI Server is NOT connected. Status: ${res.data.local_ai_server?.status}`, 'error');
                                             }
                                         } catch (err) {
-                                            alert('Failed to contact system health endpoint.');
+                                            showToast('Failed to contact system health endpoint.', 'error');
                                         } finally {
                                             setLoading(false);
                                         }
@@ -2440,13 +2482,22 @@ const Wizard = () => {
                                                     try {
                                                         const res = await axios.post('/api/system/containers/ai_engine/reload');
                                                         if (res.data.restart_required) {
-                                                            if (confirm('New provider detected. A full restart is needed. Restart now?')) {
+                                                            const shouldRestart = await confirm({
+                                                                title: 'Restart Required',
+                                                                description: 'New provider detected. A full restart is needed. Restart now?',
+                                                                confirmText: 'Restart',
+                                                                variant: 'default'
+                                                            });
+                                                            if (shouldRestart) {
                                                                 showToast('Restarting AI Engine...', 'success');
                                                                 const restartRes = await axios.post('/api/system/containers/ai_engine/restart?force=false&recreate=true');
                                                                 if (restartRes.data?.status === 'warning') {
-                                                                    const confirmForce = confirm(
-                                                                        `${restartRes.data.message}\n\nForce restart anyway? This may disconnect active calls.`
-                                                                    );
+                                                                    const confirmForce = await confirm({
+                                                                        title: 'Force Restart?',
+                                                                        description: `${restartRes.data.message}\n\nForce restart anyway? This may disconnect active calls.`,
+                                                                        confirmText: 'Force Restart',
+                                                                        variant: 'destructive'
+                                                                    });
                                                                     if (confirmForce) {
                                                                         await axios.post('/api/system/containers/ai_engine/restart?force=true&recreate=true');
                                                                         showToast('AI Engine restarted!', 'success');
@@ -2621,13 +2672,22 @@ exten => s,1,NoOp(AI Agent - Local Full)
                                                 const res = await axios.post('/api/system/containers/ai_engine/reload');
                                                 if (res.data.restart_required) {
                                                     // New provider needs full restart
-                                                    if (confirm('New provider detected. A full restart is needed to load it. Restart now?')) {
+                                                    const shouldRestart = await confirm({
+                                                        title: 'Restart Required',
+                                                        description: 'New provider detected. A full restart is needed to load it. Restart now?',
+                                                        confirmText: 'Restart',
+                                                        variant: 'default'
+                                                    });
+                                                    if (shouldRestart) {
                                                         showToast('Restarting AI Engine...', 'success');
                                                         const restartRes = await axios.post('/api/system/containers/ai_engine/restart?force=false&recreate=true');
                                                         if (restartRes.data?.status === 'warning') {
-                                                            const confirmForce = confirm(
-                                                                `${restartRes.data.message}\n\nForce restart anyway? This may disconnect active calls.`
-                                                            );
+                                                            const confirmForce = await confirm({
+                                                                title: 'Force Restart?',
+                                                                description: `${restartRes.data.message}\n\nForce restart anyway? This may disconnect active calls.`,
+                                                                confirmText: 'Force Restart',
+                                                                variant: 'destructive'
+                                                            });
                                                             if (confirmForce) {
                                                                 await axios.post('/api/system/containers/ai_engine/restart?force=true&recreate=true');
                                                                 showToast('AI Engine restarted! New provider is now available.', 'success');
@@ -2677,20 +2737,13 @@ exten => s,1,NoOp(AI Agent - Local Full)
                                     </p>
                                     <div className="relative group">
                                         <pre className="bg-black text-green-400 p-4 rounded-md overflow-x-auto text-sm font-mono">
-                                            {`; extensions_custom.conf
-[from-ai-agent]
-exten => s,1,NoOp(AI Agent Call)
- same => n,Stasis(asterisk-ai-voice-agent)
- same => n,Hangup()`}
+                                            {nonLocalDialplanSnippet}
                                         </pre>
                                         <button
                                             onClick={() => {
-                                                const dialplan = `; extensions_custom.conf
-[from-ai-agent]
-exten => s,1,NoOp(AI Agent Call)
- same => n,Stasis(asterisk-ai-voice-agent)
- same => n,Hangup()`;
-                                                navigator.clipboard.writeText(dialplan);
+                                                navigator.clipboard.writeText(nonLocalDialplanSnippet)
+                                                    .then(() => showToast('Copied to clipboard!', 'success'))
+                                                    .catch(() => showToast('Failed to copy to clipboard', 'error'));
                                             }}
                                             className="absolute top-2 right-2 p-1 bg-white/10 rounded hover:bg-white/20 text-white opacity-0 group-hover:opacity-100 transition-opacity"
                                             title="Copy to clipboard"

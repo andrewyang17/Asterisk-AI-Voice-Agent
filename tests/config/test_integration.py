@@ -24,6 +24,7 @@ class TestConfigLoading:
         monkeypatch.setenv("ASTERISK_ARI_USERNAME", "test_user")
         monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "test_pass")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+        monkeypatch.setenv("TELNYX_API_KEY", "tk-test-key")
     
     def test_load_example_config(self):
         """Should successfully load ai-agent.example.yaml."""
@@ -56,6 +57,14 @@ class TestConfigLoading:
         assert isinstance(config, AppConfig)
         # Verify pipelines were normalized
         assert hasattr(config, 'pipelines')
+
+    def test_load_golden_telnyx_config(self):
+        """Should successfully load golden Telnyx config."""
+        config = load_config("config/ai-agent.golden-telnyx.yaml")
+
+        assert isinstance(config, AppConfig)
+        assert config.active_pipeline == "telnyx_hybrid"
+        assert config.default_provider == "telnyx_hybrid"
     
     def test_config_has_required_sections(self):
         """Should have all required configuration sections."""
@@ -140,10 +149,9 @@ class TestConfigLoading:
     def test_config_version_preserved(self):
         """Should preserve config_version if present."""
         config = load_config("config/ai-agent.example.yaml")
-        
-        # Config version should be set (default is 4)
-        # Note: We don't store it in AppConfig anymore, but normalization should work
         assert config is not None
+        assert hasattr(config, "config_version")
+        assert isinstance(config.config_version, int)
 
 
 class TestConfigIntegrity:
@@ -155,6 +163,7 @@ class TestConfigIntegrity:
         monkeypatch.setenv("ASTERISK_ARI_USERNAME", "test_user")
         monkeypatch.setenv("ASTERISK_ARI_PASSWORD", "test_pass")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test-key")
+        monkeypatch.setenv("TELNYX_API_KEY", "tk-test-key")
     
     def test_all_example_configs_load_successfully(self):
         """All example configs should load without errors."""
@@ -163,6 +172,7 @@ class TestConfigIntegrity:
             "config/ai-agent.golden-openai.yaml",
             "config/ai-agent.golden-deepgram.yaml",
             "config/ai-agent.golden-local-hybrid.yaml",
+            "config/ai-agent.golden-telnyx.yaml",
         ]
         
         for config_path in example_configs:

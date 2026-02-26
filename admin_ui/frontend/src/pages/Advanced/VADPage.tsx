@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import { toast } from 'sonner';
+import { useConfirmDialog } from '../../hooks/useConfirmDialog';
 import yaml from 'js-yaml';
 import { Save, Activity, AlertCircle, RefreshCw, Loader2 } from 'lucide-react';
 import { YamlErrorBanner, YamlErrorInfo } from '../../components/ui/YamlErrorBanner';
@@ -8,13 +10,34 @@ import { ConfigCard } from '../../components/ui/ConfigCard';
 import { FormInput, FormSwitch } from '../../components/ui/FormComponents';
 import { sanitizeConfigForSave } from '../../utils/configSanitizers';
 
+const VAD_UTTERANCE_EXPERT_STORAGE_KEY = 'aava.ui.vad.utteranceExpert';
+
 const VADPage = () => {
+    const { confirm } = useConfirmDialog();
     const [config, setConfig] = useState<any>({});
     const [loading, setLoading] = useState(true);
     const [yamlError, setYamlError] = useState<YamlErrorInfo | null>(null);
     const [saving, setSaving] = useState(false);
     const [pendingRestart, setPendingRestart] = useState(false);
     const [restartingEngine, setRestartingEngine] = useState(false);
+    const [showUtteranceExpert, setShowUtteranceExpert] = useState<boolean>(() => {
+        try {
+            const v = localStorage.getItem(VAD_UTTERANCE_EXPERT_STORAGE_KEY);
+            if (v === 'true') return true;
+            if (v === 'false') return false;
+        } catch {
+            // Ignore storage failures.
+        }
+        return false;
+    });
+
+    useEffect(() => {
+        try {
+            localStorage.setItem(VAD_UTTERANCE_EXPERT_STORAGE_KEY, showUtteranceExpert ? 'true' : 'false');
+        } catch {
+            // Ignore.
+        }
+    }, [showUtteranceExpert]);
 
     useEffect(() => {
         fetchConfig();
@@ -45,10 +68,10 @@ const VADPage = () => {
             const sanitized = sanitizeConfigForSave(config);
             await axios.post('/api/config/yaml', { content: yaml.dump(sanitized) });
             setPendingRestart(true);
-            alert('VAD configuration saved successfully');
+            toast.success('VAD configuration saved');
         } catch (err) {
             console.error('Failed to save config', err);
-            alert('Failed to save configuration');
+            toast.error('Failed to save configuration');
         } finally {
             setSaving(false);
         }
@@ -61,9 +84,12 @@ const VADPage = () => {
             const response = await axios.post(`/api/system/containers/ai_engine/restart?force=${force}`);
 
             if (response.data.status === 'warning') {
-                const confirmForce = window.confirm(
-                    `${response.data.message}\n\nDo you want to force restart anyway? This may disconnect active calls.`
-                );
+                const confirmForce = await confirm({
+                    title: 'Force Restart?',
+                    description: `${response.data.message}\n\nDo you want to force restart anyway? This may disconnect active calls.`,
+                    confirmText: 'Force Restart',
+                    variant: 'destructive'
+                });
                 if (confirmForce) {
                     setRestartingEngine(false);
                     return handleReloadAIEngine(true);
@@ -72,16 +98,16 @@ const VADPage = () => {
             }
 
             if (response.data.status === 'degraded') {
-                alert(`AI Engine restarted but may not be fully healthy: ${response.data.output || 'Health check issue'}\n\nPlease verify manually.`);
+                toast.warning('AI Engine restarted but may not be fully healthy', { description: response.data.output || 'Please verify manually' });
                 return;
             }
 
             if (response.data.status === 'success') {
                 setPendingRestart(false);
-                alert('AI Engine restarted! Changes are now active.');
+                toast.success('AI Engine restarted! Changes are now active.');
             }
         } catch (error: any) {
-            alert(`Failed to restart AI Engine: ${error.response?.data?.detail || error.message}`);
+            toast.error('Failed to restart AI Engine', { description: error.response?.data?.detail || error.message });
         } finally {
             setRestartingEngine(false);
         }
@@ -96,6 +122,19 @@ const VADPage = () => {
             }
         });
     };
+
+    useEffect(() => {
+        const vad = config?.vad || {};
+        const hasExpertOverrides = [
+            'min_utterance_duration_ms',
+            'max_utterance_duration_ms',
+            'utterance_padding_ms',
+            'fallback_buffer_size',
+        ].some((field) => vad[field] !== undefined);
+        if (hasExpertOverrides) {
+            setShowUtteranceExpert(true);
+        }
+    }, [config?.vad]);
 
     if (loading) return <div className="p-8 text-center text-muted-foreground">Loading configuration...</div>;
 
@@ -260,6 +299,66 @@ const VADPage = () => {
                                 value={vadConfig.webrtc_end_silence_frames ?? 15}
                                 onChange={(e) => updateVADConfig('webrtc_end_silence_frames', parseInt(e.target.value))}
                                 tooltip="Number of consecutive “silence” frames needed to declare speech ended. Higher avoids cutting off trailing words but increases tail latency."
+                            />
+                        </div>
+                    </div>
+                </ConfigCard>
+            </ConfigSection>
+
+            <ConfigSection
+                title="Utterance Controls"
+                description="Fine-grained utterance boundary tuning for engine-side heuristics."
+            >
+                <ConfigCard>
+                    <div className="space-y-6">
+                        <div className="border border-amber-300/40 rounded-lg p-3 bg-amber-500/5">
+                            <FormSwitch
+                                label="Utterance Expert Settings"
+                                description="Enable editing of low-level utterance timing and buffer controls."
+                                checked={showUtteranceExpert}
+                                onChange={(e) => setShowUtteranceExpert(e.target.checked)}
+                                className="mb-0 border-0 p-0 bg-transparent"
+                            />
+                            <p className={`text-xs mt-2 ${showUtteranceExpert ? 'text-amber-700 dark:text-amber-400' : 'text-muted-foreground'}`}>
+                                {showUtteranceExpert
+                                    ? 'Warning: these controls can clip speech, delay turn-taking, or over-buffer audio if tuned aggressively.'
+                                    : 'Expert values are visible and read-only until enabled.'}
+                            </p>
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormInput
+                                label="Min Utterance Duration (ms)"
+                                type="number"
+                                value={vadConfig.min_utterance_duration_ms ?? 800}
+                                onChange={(e) => updateVADConfig('min_utterance_duration_ms', parseInt(e.target.value))}
+                                tooltip="Minimum duration to consider detected speech a valid utterance."
+                                disabled={!showUtteranceExpert}
+                            />
+                            <FormInput
+                                label="Max Utterance Duration (ms)"
+                                type="number"
+                                value={vadConfig.max_utterance_duration_ms ?? 8000}
+                                onChange={(e) => updateVADConfig('max_utterance_duration_ms', parseInt(e.target.value))}
+                                tooltip="Hard cap for a single utterance before forced boundary handling."
+                                disabled={!showUtteranceExpert}
+                            />
+                        </div>
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                            <FormInput
+                                label="Utterance Padding (ms)"
+                                type="number"
+                                value={vadConfig.utterance_padding_ms ?? 100}
+                                onChange={(e) => updateVADConfig('utterance_padding_ms', parseInt(e.target.value))}
+                                tooltip="Extra audio kept around utterance boundaries for naturalness."
+                                disabled={!showUtteranceExpert}
+                            />
+                            <FormInput
+                                label="Fallback Buffer Size (bytes)"
+                                type="number"
+                                value={vadConfig.fallback_buffer_size ?? 128000}
+                                onChange={(e) => updateVADConfig('fallback_buffer_size', parseInt(e.target.value))}
+                                tooltip="Internal fallback buffer size used by engine-side VAD fallback paths."
+                                disabled={!showUtteranceExpert}
                             />
                         </div>
                     </div>

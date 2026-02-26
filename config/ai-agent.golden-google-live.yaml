@@ -20,7 +20,7 @@
 # For the full case study, see: docs/case-studies/Google-Live-Golden-Baseline.md
 # ═══════════════════════════════════════════════════════════════════════════
 
-config_version: 4
+config_version: 6
 active_pipeline: local_hybrid  # Don't change - uses provider override via contexts
 default_provider: google_live
 
@@ -123,6 +123,21 @@ profiles:
       sample_rate_hz: 8000
 
 # Provider Configuration - Google Live
+#
+# ── Vertex AI mode (enterprise / fixed function calling) ──────────────────
+# To use Vertex AI instead of the Developer API, set use_vertex_ai: true
+# and configure your GCP project. See .env.example for auth setup.
+#
+# providers:
+#   google_live:
+#     use_vertex_ai: true
+#     vertex_project: ${GOOGLE_CLOUD_PROJECT}
+#     vertex_location: ${GOOGLE_CLOUD_LOCATION:-us-central1}
+#     llm_model: gemini-live-2.5-flash-native-audio   # GA model (fixed function calling)
+#     # api_key is NOT used in Vertex AI mode; auth via GOOGLE_APPLICATION_CREDENTIALS
+#     ... (all other fields below remain the same)
+#
+# ── Developer API mode (default, API key) ─────────────────────────────────
 providers:
   google_live:
     api_key: ${GOOGLE_API_KEY}
@@ -146,17 +161,17 @@ providers:
     target_encoding: ulaw
     target_sample_rate_hz: 8000
     # Model + tuning
-    llm_model: gemini-2.5-flash-native-audio-preview-12-2025
-    llm_temperature: 0.8
-    llm_max_output_tokens: 8192
-    llm_top_p: 0.95
-    llm_top_k: 40
+    llm_model: gemini-2.5-flash-native-audio-latest
+    llm_temperature: 0.4
+    llm_max_output_tokens: 768
+    llm_top_p: 0.9
+    llm_top_k: 20
     # Voice + modalities
     tts_voice_name: Aoede
     response_modalities: audio
     # Transcription
     enable_input_transcription: true
-    enable_output_transcription: true
+    enable_output_transcription: false
 
 # LLM fallback (unused in full agent mode but required by schema)
 llm:
@@ -195,4 +210,3 @@ external_media:
   port_range: 18080:18099
   rtp_host: 0.0.0.0
   rtp_port: 18080
-

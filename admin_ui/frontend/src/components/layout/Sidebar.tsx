@@ -19,6 +19,7 @@ import {
     AlertTriangle,
     Code,
     HelpCircle,
+    ExternalLink,
     HardDrive,
     ArrowUpCircle,
     Phone,
@@ -90,7 +91,7 @@ const Sidebar = () => {
                 </SidebarGroup>
 
                 <SidebarGroup title="Advanced Settings">
-                    <SidebarItem to="/vad" icon={Activity} label="VAD" />
+                    <SidebarItem to="/vad" icon={Activity} label="Voice Activity Detection" />
                     <SidebarItem to="/streaming" icon={Zap} label="Streaming" />
                     <SidebarItem to="/llm" icon={Brain} label="LLM Defaults" />
                     <SidebarItem to="/transport" icon={Radio} label="Audio Transport" />
@@ -100,6 +101,7 @@ const Sidebar = () => {
                 <SidebarGroup title="System">
                     <SidebarItem to="/env" icon={Globe} label="Environment" />
                     <SidebarItem to="/docker" icon={Container} label="Docker Services" />
+                    <SidebarItem to="/asterisk" icon={Phone} label="Asterisk" />
                     <SidebarItem to="/models" icon={HardDrive} label="Models" />
                     <SidebarItem to="/updates" icon={ArrowUpCircle} label="Updates" />
                     <SidebarItem to="/logs" icon={FileText} label="Logs" />
@@ -112,6 +114,15 @@ const Sidebar = () => {
 
                 <SidebarGroup title="Support">
                     <SidebarItem to="/help" icon={HelpCircle} label="Help" />
+                    <a
+                        href="/docs"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center gap-3 px-3 py-2 rounded-md text-sm font-medium text-muted-foreground hover:bg-accent hover:text-foreground transition-colors"
+                    >
+                        <ExternalLink className="w-4 h-4" />
+                        API Docs
+                    </a>
                 </SidebarGroup>
             </div>
 

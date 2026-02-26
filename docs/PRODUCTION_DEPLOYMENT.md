@@ -1,6 +1,6 @@
 # Production Deployment Guide
 
-Best practices and recommendations for deploying Asterisk AI Voice Agent `v5.0+` in production environments.
+Best practices and recommendations for deploying Asterisk AI Voice Agent `v6.0+` in production environments.
 
 ## Overview
 
@@ -39,8 +39,9 @@ This guide covers production deployment considerations, security hardening, scal
 ### Configuration Files
 
 - [ ] **`.env` file**: All required environment variables set
-- [ ] **`config/ai-agent.yaml`**: Production configuration selected
-- [ ] **Shared Storage**: `./asterisk_media/ai-generated` configured (mounted into `ai-engine` as `/mnt/asterisk_media/ai-generated`) (for Local Hybrid)
+- [ ] **`config/ai-agent.yaml`**: Production baseline configuration
+- [ ] **`config/ai-agent.local.yaml`**: Operator overrides (created by Admin UI / CLI wizard; git-ignored)
+- [ ] **Shared Storage**: `./asterisk_media/ai-generated` configured (mounted into `ai_engine` as `/mnt/asterisk_media/ai-generated`) (for Local Hybrid)
 - [ ] **Call History**: `./data` volume persisted (default DB: `./data/call_history.db`)
 - [ ] **Monitoring (optional)**: Prometheus scraping `/metrics` (aggregate metrics only)
 
@@ -65,12 +66,12 @@ This guide covers production deployment considerations, security hardening, scal
 │  Single Server (8 cores, 16GB RAM)    │
 │                                        │
 │  ┌──────────┐    ┌─────────────────┐ │
-│  │ Asterisk │────│   ai-engine     │ │
+│  │ Asterisk │────│   ai_engine     │ │
 │  │  +       │    │                 │ │
 │  │ FreePBX  │    │  (Docker)       │ │
 │  └──────────┘    └─────────────────┘ │
 │                   ┌─────────────────┐ │
-│                   │ local-ai-server │ │
+│                   │ local_ai_server │ │
 │                   │  (Optional)     │ │
 │                   └─────────────────┘ │
 └────────────────────────────────────────┘
@@ -99,7 +100,7 @@ This guide covers production deployment considerations, security hardening, scal
 │   (FreePBX)     │ ARI  │   Server        │
 │                 │      │                 │
 │  8 cores        │      │  ┌──────────┐   │
-│  16GB RAM       │      │  │ai-engine │   │
+│  16GB RAM       │      │  │ai_engine │   │
 │                 │      │  └──────────┘   │
 └─────────────────┘      │  ┌──────────┐   │
                          │  │local-ai  │   │
@@ -136,7 +137,7 @@ This guide covers production deployment considerations, security hardening, scal
         ┌───────────────────┼───────────────────┐
         │                   │                   │
    ┌────▼────┐         ┌────▼────┐        ┌────▼────┐
-   │ai-engine│         │ai-engine│        │ai-engine│
+   │ai_engine│         │ai_engine│        │ai_engine│
    │ node 1  │         │ node 2  │        │ node 3  │
    └────┬────┘         └────┬────┘        └────┬────┘
         │                   │                   │
@@ -206,7 +207,7 @@ ls -l .env
 # 3. Update .env file
 vi .env  # Update OPENAI_API_KEY or DEEPGRAM_API_KEY
 
-# 4. Restart ai-engine
+# 4. Restart `ai_engine`
 docker compose restart ai_engine
 
 # 5. Verify with test call
@@ -232,7 +233,7 @@ external_media:
 
 **Key Considerations:**
 
-1. **Port Accessibility**: UDP port 18080 must be accessible from Asterisk to ai-engine
+1. **Port Accessibility**: UDP port 18080 must be accessible from Asterisk to `ai_engine`
    ```bash
    # Verify port is listening
    netstat -tuln | grep 18080
@@ -253,7 +254,7 @@ external_media:
    - Monitor network quality with `ping` and `mtr`
 
 5. **Provider Compatibility**:
-   - **Local Hybrid / pipelines**: ExternalMedia RTP is the shipped default and is a strong production choice. File playback is the most robust option; streaming-first is supported with automatic fallback to file.
+   - **Local Hybrid / pipelines**: ExternalMedia RTP is a strong production choice for modular pipelines. File playback is the most robust option; streaming-first is supported with automatic fallback to file.
    - **Full agents (OpenAI Realtime / Deepgram / Google Live / ElevenLabs)**: AudioSocket + streaming playback is validated for low-latency, real-time UX.
 
 **When to Use ExternalMedia:**
@@ -278,8 +279,8 @@ external_media:
 ufw default deny incoming
 ufw default allow outgoing
 
-# Asterisk ARI (from ai-engine only)
-ufw allow from <ai-engine-ip> to any port 8088 proto tcp
+# Asterisk ARI (from `ai_engine` only)
+ufw allow from <ai_engine-ip> to any port 8088 proto tcp
 
 # AudioSocket (from Asterisk only)
 ufw allow from <asterisk-ip> to any port 8090 proto tcp
@@ -335,7 +336,7 @@ The default `docker-compose.yml` uses host networking:
 ```yaml
 # docker-compose.yml (default)
 services:
-  ai-engine:
+  ai_engine:
     network_mode: host
 ```
 
@@ -358,7 +359,7 @@ For deployments that require explicit port isolation and tighter security postur
 ```yaml
 # Example (bridge mode)
 services:
-  ai-engine:
+  ai_engine:
     ports:
       - "8090:8090"        # AudioSocket
       - "18080:18080/udp"  # ExternalMedia RTP
@@ -401,7 +402,7 @@ HEALTH_BIND_HOST=0.0.0.0
 ```yaml
 # docker-compose.yml
 services:
-  ai-engine:
+  ai_engine:
     ports:
       - "8090:8090"    # AudioSocket
       - "18080:18080"  # RTP
@@ -423,7 +424,7 @@ services:
 ┌─────────────────────────────┐
 │  Single Server              │
 │  ┌────────┐   ┌──────────┐ │
-│  │Asterisk├───┤ai-engine │ │
+│  │Asterisk├───┤ai_engine │ │
 │  │        │   │ (host)   │ │
 │  └────────┘   └──────────┘ │
 │  Via: 127.0.0.1             │
@@ -465,7 +466,7 @@ services:
 ```yaml
 # In docker-compose.yml
 services:
-  ai-engine:
+  ai_engine:
     user: "1000:1000"  # Non-root UID:GID
     security_opt:
       - no-new-privileges:true
@@ -474,7 +475,7 @@ services:
 **Limit resources**:
 ```yaml
 services:
-  ai-engine:
+  ai_engine:
     deploy:
       resources:
         limits:
@@ -488,7 +489,7 @@ services:
 **Read-only filesystem** (where possible):
 ```yaml
 services:
-  ai-engine:
+  ai_engine:
     read_only: true
     tmpfs:
       - /tmp
@@ -546,6 +547,7 @@ If you need enterprise-grade secrets management:
 ```
 .env
 config/ai-agent.yaml
+config/ai-agent.local.yaml   # operator overrides (if exists)
 docker-compose.yml
 ```
 
@@ -559,7 +561,7 @@ If you run Prometheus/Grafana, back up their persistent storage per your monitor
 
 **Generated Audio Files** (optional):
 ```
-./asterisk_media/ai-generated/  # default host path (mounted as /mnt/asterisk_media/ai-generated in ai-engine)
+./asterisk_media/ai-generated/  # default host path (mounted as /mnt/asterisk_media/ai-generated in `ai_engine`)
 ```
 
 **Logs** (for compliance):
@@ -587,6 +589,7 @@ mkdir -p "$BACKUP_PATH"
 # Backup configuration
 cp .env "$BACKUP_PATH/"
 cp config/ai-agent.yaml "$BACKUP_PATH/"
+cp config/ai-agent.local.yaml "$BACKUP_PATH/" 2>/dev/null || true
 cp docker-compose*.yml "$BACKUP_PATH/"
 
 # Backup Prometheus data
@@ -675,6 +678,7 @@ aws s3 sync /backups/ai-voice-agent/ "$BUCKET/" \
    LATEST_BACKUP="/backups/ai-voice-agent/backup_20251029_020000"
    cp "$LATEST_BACKUP/.env" .
    cp "$LATEST_BACKUP/config/ai-agent.yaml" config/
+   cp "$LATEST_BACKUP/config/ai-agent.local.yaml" config/ 2>/dev/null || true
    ```
 
 5. **Start services**:
@@ -705,7 +709,7 @@ aws s3 sync /backups/ai-voice-agent/ "$BUCKET/" \
 - Docker container restarts
 
 **Application Health**:
-- ai-engine health endpoint down
+- `ai_engine` health endpoint down
 - No active calls for > 1 hour during business hours
 - Turn response latency p95 > 2s
 - Audio underflow rate > 2 per call
@@ -808,7 +812,7 @@ echo "=== End Health Check ==="
 
 ### Upgrade Procedures
 
-**Minor Version Upgrade** (e.g., v4.0.0 → v4.0.1):
+**Minor Version Upgrade** (e.g., v6.1.0 → v6.1.1):
 
 ```bash
 # 1. Backup current state
@@ -816,10 +820,10 @@ echo "=== End Health Check ==="
 
 # 2. Pull latest code
 git fetch origin
-git checkout v4.0.1  # Or: git pull origin main
+git checkout v6.2.0  # Or: git pull origin main
 
 # 3. Compare configuration changes
-git diff v4.0.0..v4.0.1 config/ai-agent.example.yaml
+git diff v6.1.1..v6.2.0 config/ai-agent.example.yaml
 
 # 4. Update if needed
 # Review and update config/ai-agent.yaml
@@ -834,11 +838,11 @@ docker compose logs -f ai_engine
 # 7. Make test call
 
 # 8. Rollback if issues
-# git checkout v4.0.0
+# git checkout v6.1.0
 # docker compose up -d --force-recreate ai_engine
 ```
 
-**Major Version Upgrade** (e.g., v4.x → v5.x):
+**Major Version Upgrade** (e.g., v5.x → v6.x):
 
 1. **Review CHANGELOG.md** for breaking changes
 2. **Test in staging environment** first
@@ -866,12 +870,12 @@ docker compose logs -f ai_engine
 ```yaml
 # docker-compose.yml
 services:
-  ai-engine:
+  ai_engine:
     logging:
       driver: "syslog"
       options:
         syslog-address: "tcp://log-server:514"
-        tag: "ai-engine"
+        tag: "ai_engine"
 ```
 
 **Log Analysis**:
@@ -883,7 +887,7 @@ docker logs ai_engine --since 1h 2>&1 | grep -i error
 docker logs ai_engine --since 24h 2>&1 | grep -i warning | wc -l
 
 # Export logs for analysis
-docker logs ai_engine --since 24h > /tmp/ai-engine.log
+docker logs ai_engine --since 24h > /tmp/ai_engine.log
 ```
 
 ---
@@ -1008,7 +1012,7 @@ barge_in:
 ```yaml
 # docker-compose.yml
 services:
-  ai-engine:
+  ai_engine:
     deploy:
       resources:
         limits:
@@ -1029,12 +1033,12 @@ ulimit -n 65536
 
 ## Migration from Existing System
 
-### From Legacy v3.0
+### From Legacy Versions (v3.x / v4.x / v5.x)
 
-1. **Review Breaking Changes**: Check CHANGELOG.md
-2. **Update Configuration Format**: v4.0 uses unified YAML structure
+1. **Review Breaking Changes**: Check CHANGELOG.md and [Migration Guide](MIGRATION.md)
+2. **Update Configuration Format**: v6.x uses a three-file config layout (`ai-agent.yaml`, `ai-agent.local.yaml`, `.env`)
 3. **Test Golden Baselines**: Try recommended configurations first
-4. **Migrate Gradually**: Run v3.0 and v4.0 side-by-side initially
+4. **Migrate Gradually**: Test in a staging environment before switching production
 
 ### From Other AI Voice Systems
 

@@ -276,13 +276,13 @@ AI: "Perfect! I'll send the transcript there shortly."
 
 **Example Email**:
 ```
-Subject: Call Summary - (925) 736-6718 - 2025-11-10 16:43
+Subject: Call Summary - +1 (555) 010-1234 - 2025-11-10 16:43
 
 Hello Admin,
 
 Call Summary
 Duration: 1m 24s
-Caller: John Smith ((925) 736-6718)
+Caller: John Smith (+1 (555) 010-1234)
 Time: November 10, 2025 at 4:43 PM
 
 Transcript:
@@ -815,6 +815,45 @@ tools:
         description: "Support team ring group"
 
   # ----------------------------------------------------------------------------
+  # LIVE AGENTS - Human extensions used by live_agent_transfer()
+  # ----------------------------------------------------------------------------
+  #
+  # These are NOT normal transfer destinations. They represent real human endpoints
+  # (extensions) that the AI can hand off to when the caller explicitly asks for a
+  # "live agent" / "human" / "representative".
+  #
+  # Admin UI: Tools -> Live Agents
+  #
+  extensions:
+    internal:
+      "6000":
+        name: "Live Support Agent"
+        dial_string: "PJSIP/6000"
+        device_state_tech: auto
+        description: "Live customer service representative"
+        transfer: true
+
+  # ----------------------------------------------------------------------------
+  # LIVE AGENT OVERRIDE (Advanced/Legacy)
+  # ----------------------------------------------------------------------------
+  #
+  # Default behavior: live_agent_transfer() routes to tools.extensions.internal.
+  #
+  # Advanced/legacy override: route live-agent requests via a normal transfer
+  # destination key (queue/ringgroup/extension). Enable this only if you
+  # intentionally want "live agent" requests to behave like a normal transfer
+  # destination.
+  #
+  # transfer:
+  #   live_agent_destination_key: "support_queue"
+  #   destinations:
+  #     support_queue:
+  #       type: queue
+  #       target: "301"
+  #       description: "Technical support queue"
+  #       live_agent: true
+
+  # ----------------------------------------------------------------------------
   # ATTENDED_TRANSFER - Warm transfer with announcement + DTMF acceptance
   # ----------------------------------------------------------------------------
   attended_transfer:
@@ -863,28 +902,60 @@ tools:
   # ----------------------------------------------------------------------------
   send_email_summary:
     enabled: true                      # Enable auto-send after calls
-    provider: "resend"
-    api_key: "${RESEND_API_KEY}"       # Set in .env file
+    provider: "auto"                   # auto | smtp | resend
     from_email: "agent@yourdomain.com"
     from_name: "AI Voice Agent"
     admin_email: "admin@yourdomain.com"
+    # Optional: route different contexts to different inboxes
+    # admin_email_by_context:
+    #   support: "support@yourdomain.com"
+    #   sales: "sales@yourdomain.com"
+    # Optional: route sender address per context
+    # from_email_by_context:
+    #   support: "support-bot@yourdomain.com"
+    #   sales: "sales-bot@yourdomain.com"
     include_transcript: true
     include_metadata: true
+    # Optional: subject prefix and per-context overrides
+    # subject_prefix: "[AAVA]"
+    # subject_prefix_by_context:
+    #   support: "[Support]"
+    #   sales: "[Sales]"
+    # Optional: include context tag like [support] in the subject
+    # include_context_in_subject: true
+    # Optional: override full HTML template (Jinja2). You can edit/preview in Admin UI → Tools.
+    # html_template: |
+    #   <html>...</html>
   
   # ----------------------------------------------------------------------------
   # REQUEST_TRANSCRIPT - Caller-initiated transcript requests
   # ----------------------------------------------------------------------------
   request_transcript:
     enabled: true                      # Allow caller transcript requests
-    provider: "resend"
-    api_key: "${RESEND_API_KEY}"
+    provider: "auto"                   # auto | smtp | resend
     from_email: "agent@yourdomain.com"
     from_name: "AI Voice Agent"
     admin_email: "admin@yourdomain.com"  # Admin receives BCC
+    # Optional: route BCC by context
+    # admin_email_by_context:
+    #   support: "support@yourdomain.com"
+    #   sales: "sales@yourdomain.com"
+    # Optional: route sender address per context
+    # from_email_by_context:
+    #   support: "support-bot@yourdomain.com"
+    #   sales: "sales-bot@yourdomain.com"
     confirm_email: true                # AI reads back email
     validate_domain: true              # DNS MX lookup
+    # Optional: include context tag like [support] in the subject
+    # include_context_in_subject: true
+    # Note: by default, only the most recent confirmed email is used per call.
+    # Set to true to allow multiple recipients (not recommended for most deployments).
+    # allow_multiple_recipients: false
     max_attempts: 2                    # Retry attempts for invalid email
     common_domains: ["gmail.com", "yahoo.com", "outlook.com"]
+    # Optional: override full HTML template (Jinja2). You can edit/preview in Admin UI → Tools.
+    # html_template: |
+    #   <html>...</html>
 ```
 
 ### Enable Tools per Context / Pipeline (Allowlisting)
@@ -900,6 +971,7 @@ contexts:
     provider: google_live
     tools:
       - attended_transfer   # warm transfer
+      - live_agent_transfer # explicit: caller asked for a live human agent
       - cancel_transfer
       - hangup_call
       - request_transcript
@@ -915,7 +987,14 @@ contexts:
 # Resend API (for email tools)
 RESEND_API_KEY=re_xxxxxxxxxxxx
 
-# Get API key from: https://resend.com
+# SMTP (optional): local mail server for email tools
+SMTP_HOST=smtp.yourcompany.com
+SMTP_PORT=587
+SMTP_USERNAME=your_user
+SMTP_PASSWORD=your_password
+SMTP_TLS_MODE=starttls  # starttls | smtps | none
+SMTP_TLS_VERIFY=true
+SMTP_TIMEOUT_SECONDS=10
 ```
 
 **Best Practice**: Only `RESEND_API_KEY` goes in `.env` (secret). Email addresses go in `ai-agent.yaml` (configuration, not secret).

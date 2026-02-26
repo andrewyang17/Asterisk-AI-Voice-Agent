@@ -21,7 +21,7 @@
 # For the provider guide, see: docs/Provider-ElevenLabs-Setup.md
 # ═══════════════════════════════════════════════════════════════════════════
 
-config_version: 4
+config_version: 6
 active_pipeline: local_hybrid  # Don't change - uses provider override via contexts
 default_provider: elevenlabs_agent
 
@@ -155,6 +155,21 @@ providers:
       similarity_boost: 0.75
       style: 0.0
       use_speaker_boost: true
+
+  # ElevenLabs TTS - Modular pipeline adapter for STT→LLM→TTS pipelines
+  # Use this with pipelines (e.g., local_stt + openai_llm + elevenlabs_tts)
+  elevenlabs_tts:
+    type: elevenlabs
+    enabled: true
+    capabilities:
+      - tts
+    voice_id: "21m00Tcm4TlvDq8ikWAM"   # Rachel (warm, professional)
+    model_id: "eleven_turbo_v2_5"        # Fast, high-quality
+    output_format: "ulaw_8000"           # Telephony-optimized
+    stability: 0.5
+    similarity_boost: 0.75
+    style: 0.0
+    use_speaker_boost: true
 
 # LLM fallback (unused in full agent mode but required by schema)
 llm:

@@ -12,6 +12,217 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Additional provider integrations
 - Enhanced monitoring features
 
+## [6.2.2] - 2026-02-20
+
+### Fixed
+
+- **Vertex AI Credentials Not Found**: Auto-inject `GOOGLE_APPLICATION_CREDENTIALS` env var when the service account JSON file exists at the default mount path (`/app/project/secrets/gcp-service-account.json`). Handles 3 cases: env var unset, env var pointing to missing file (override), and stale pointer with no fallback (unset to prevent ADC crash).
+- **Vertex AI ADC Graceful Fallback**: When `use_vertex_ai: true` but ADC fails (e.g. no service account uploaded), the Google Live provider now falls back to Developer API (api_key) mode instead of crashing the call with `DefaultCredentialsError`. Consistent `_vertex_active` instance flag ensures model path, tool responses, and connection URL all use the correct API format after fallback.
+- **Secrets Directory Permissions**: `setup_secrets_directory()` in `install.sh` now always fixes ownership to UID 1000 (appuser) with mode 2770, not just on creation. Fixes "Permission denied" when uploading Vertex AI credentials via Admin UI (backend runs as appuser via gosu).
+- **False "Apply Changes" for local_ai_server** (AAVA-192 related): Environment page no longer shows restart prompts for containers that aren't running — prevents confusing drift detection when `local_ai_server` is intentionally stopped.
+- **AAVA-192 — install.sh Duplicate YAML Keys**: Fallback path in `update_yaml_llm()` no longer blindly appends a duplicate `llm:` block. Uses Python/PyYAML or sed-based in-place update when the block already exists.
+- **AAVA-185 — Dashboard Pipeline Variant Display**: Wizard now sets `active_pipeline` and `default_provider` to the variant-specific name (e.g. `local_hybrid_groq`) when Groq LLM is selected. Dashboard topology adds defensive variant matching for backward compatibility.
+
+### Added
+
+- **Secrets Directory in install.sh**: `setup_secrets_directory()` creates `./secrets/` with correct permissions (2770) during installation, aligning with `preflight.sh`.
+- **COMPOSE_PROJECT_NAME Auto-set**: `install.sh` now ensures `COMPOSE_PROJECT_NAME=asterisk-ai-voice-agent` is set in `.env` for consistency with `preflight.sh`.
+- **Auto-upsert GOOGLE_APPLICATION_CREDENTIALS on Upload**: When Vertex AI credentials are uploaded via Admin UI, the env var is automatically added to `.env` for persistence across container recreates.
+
+### Migration from v6.2.1
+
+1. **No breaking changes.** All fixes are backward compatible.
+2. **Vertex AI users**: Credentials will be auto-detected on next container restart — no manual `.env` editing needed.
+3. **Docker rebuild required**: Run `docker compose up -d --build --force-recreate` to pick up all fixes.
+
+## [6.2.1] - 2026-02-20
+
+### Added
+
+- **Google Vertex AI Live API Support**: Enterprise-grade authentication for Google Live API using GCP service accounts. Switch between Developer API (API key) and Vertex AI (OAuth2) modes via Admin UI toggle. Includes credential upload/verify/delete endpoints, environment injection, and preflight secrets directory validation ([PR #235](https://github.com/hkjarral/Asterisk-AI-Voice-Agent/pull/235)).
+- **Admin UI Vertex AI Configuration**: New Vertex AI section in Google Live provider settings with project/location selectors, credential upload widget, and real-time verification status.
+- **Preflight Secrets Directory Check**: `preflight.sh` now validates and auto-creates `./secrets/` with correct ownership and permissions (2770) for service account JSON files.
+- **Golden Baseline Config**: `config/ai-agent.golden-google-live.yaml` updated with Vertex AI configuration examples.
+
+### Changed
+
+- **Google Live Provider**: Dual-mode endpoint construction — Vertex AI uses `{location}-aiplatform.googleapis.com` with OAuth2 bearer tokens; Developer API unchanged.
+- **Tool Response Format**: Removed `id` field from `functionResponses` when using Vertex AI (not supported by Vertex API).
+
+### Fixed
+
+- **Async Blocking Call**: `credentials.refresh()` now runs in thread pool to avoid blocking asyncio event loop.
+- **Exception Leaking**: Vertex AI endpoints no longer expose internal error details to clients.
+- **Null Filename Check**: `upload_vertex_credentials` validates `file.filename` before use.
+
+### Documentation
+
+- Milestone 25: Google Vertex AI Live API Support (`docs/contributing/milestones/milestone-25-google-vertex.md`)
+
+### Migration from v6.2.0
+
+1. **No breaking changes.** Vertex AI is opt-in; existing API key mode works unchanged.
+2. **Vertex AI users**: Upload service account JSON via Admin UI → Google Live → Vertex AI Configuration.
+3. **Docker rebuild required**: Run `docker compose up -d --build --force-recreate` for secrets volume mount.
+
+## [6.2.0] - 2026-02-15
+
+### Added
+
+- **NumPy Audio Resampler**: Replaced legacy `audioop.ratecv` with NumPy linear interpolation at all 19 call sites, eliminating audio crackling artifacts. Community contribution by [@turgutguvercin](https://github.com/turgutguvercin) ([PR #204](https://github.com/hkjarral/Asterisk-AI-Voice-Agent/pull/204)).
+- **Google Native Audio Latest Model**: Support for `gemini-2.5-flash-native-audio-latest` — Google's audio-native model with true audio understanding, tuned defaults for telephony use cases.
+- **Google Live VAD Tuning**: `realtimeInputConfig` support for short utterance detection; configurable via Admin UI advanced settings.
+- **Google Live Keepalive Expert Knobs**: Smoother config updates and WebSocket keepalive tuning for long-running sessions.
+- **Google Live Input Gain Normalization**: Provider-level input gain for consistent audio levels across telephony trunks.
+- **Admin UI Tool Catalog**: Read-only page listing all available built-in and MCP tools with descriptions and parameter schemas (PR #211).
+- **Admin UI Google Live Settings**: VAD tuning and hangup fallback tooltips exposed as advanced provider settings.
+- **Agent CLI `check --fix`**: Auto-repair common configuration issues with minimal production baseline config for recovery; hardened restore logic (PR #210).
+- **Telnyx AI Inference LLM**: New modular pipeline provider `telnyx_llm` using OpenAI-compatible Chat Completions via Telnyx AI Inference. Access 53+ models (GPT-4o, Claude, Llama, Mistral) with a single `TELNYX_API_KEY`. Includes golden baseline config, Admin UI provider form, and setup guide. Community contribution by Abhishek @ Telnyx ([PR #219](https://github.com/hkjarral/Asterisk-AI-Voice-Agent/pull/219)).
+- **Preflight `--force`**: Bypass unsupported OS check for exotic distributions.
+
+### Changed
+
+- **Google Live Farewell Handling**: Settled on farewell-play-out design (removed experimental auto-reconnect on 1008 disconnect); neutralized tool response to prevent duplicate farewells.
+- **Google Live TTS Gating**: Per-segment re-arm so silence replaces echo on every turn; enabled on AudioSocket transport.
+- **Call Ending Prompts**: Tightened prompts to prevent verbal farewell before `hangup_call` tool invocation across all providers.
+- **Transparent Model Name Flow**: Removed silent fallback/remapping for Google Live model names; aligned names across UI and wizard.
+- **Demo Contexts Restored**: All 11 demo contexts from v6.0.0 baseline restored.
+
+### Fixed
+
+- **Audio Crackling**: NumPy resampler fixes crackling caused by `audioop.ratecv` discontinuities ([PR #204](https://github.com/hkjarral/Asterisk-AI-Voice-Agent/pull/204), [@turgutguvercin](https://github.com/turgutguvercin)).
+- **Call Termination Hardening**: 13 fixes across providers, engine, and AudioSocket for reliable call endings and proper cleanup.
+- **Google Live Duplicate Farewell**: 6+ iterations eliminating race conditions between tool-ack `turnComplete`, forced farewell, and model post-hangup speech.
+- **Google Live Premature Hangup**: Fixed hangup firing on tool-acknowledgment `turnComplete` before farewell audio finishes playing.
+- **Google Live Model Names**: Transparent model name flow — removed silent fallback/remapping; aligned names across UI and wizard.
+- **Pipeline Call History**: Tool calls now recorded in session so they appear in Admin UI Call History.
+- **Provider Topology Accuracy**: Clear stale `provider_name` on pipeline calls so UI topology is accurate.
+- **Agent CLI Conflict Markers**: Reduced conflict-marker false positives in `agent check`.
+- **Agent CLI Wizard Logger**: Removed invalid logger kwargs.
+- **Agent CLI Restore Safety**: Hardened `check --fix` restore to avoid partial writes.
+- **Admin UI Tool Catalog**: Removed unreachable except in tool catalog (PR #212).
+
+### Security
+
+- **CodeQL SSRF Fix**: Google API key now passed as params instead of URL path to prevent SSRF (CodeQL alert).
+
+### Documentation
+
+- Telnyx AI Inference Provider Setup Guide (`docs/Provider-Telnyx-Setup.md`)
+- Milestones 23 (NAT) and 24 (Phase Tools) added to milestone history
+- Complete documentation, roadmap, and community alignment overhaul
+- Roadmap and Milestone History links added to main README hero nav bar
+
+### Migration from v6.1.1
+
+1. **No breaking changes.** All new features are additive or opt-in.
+2. Existing `config/ai-agent.yaml` continues to work unchanged.
+3. **Docker rebuild required**: Run `docker compose up -d --build --force-recreate` for all containers.
+4. **Telnyx users**: Add `TELNYX_API_KEY` to `.env` and configure `telnyx_hybrid` pipeline. See `docs/Provider-Telnyx-Setup.md`.
+5. **Google Live users**: Default model updated to `gemini-2.5-flash-native-audio-latest`. No action needed unless you pinned a specific model.
+
+## [6.1.1] - 2026-02-09
+
+### Added
+
+- **Operator Config Override (`ai-agent.local.yaml`)**: Operator customizations are now stored in `config/ai-agent.local.yaml` (git-ignored), deep-merged on top of the base `config/ai-agent.yaml` at startup. All Admin UI saves, CLI wizard writes, and `agent setup` output target the local file, so upstream `git pull` never conflicts with operator config. Local overrides can delete base keys by setting them to `null`.
+- **Graceful Stash Pop Recovery**: `agent update` now automatically recovers from `git stash pop` merge conflicts by resetting the working tree, dropping the failed stash, and restoring operator config (`.env`, `ai-agent.yaml`, `ai-agent.local.yaml`, `users.json`, `contexts/`) from the pre-update backup.
+- **Live Agent Transfer Tool**: Explicit `live_agent_transfer` tool with ARI-based extension status checks, auto-derived internal extension keys, and fallback routing to configured live-agent destinations.
+- **ARI Extension Status API**: Admin UI endpoint to query Asterisk device/endpoint state for live agent availability before transferring.
+- **ViciDial Outbound Dialer Compatibility**: Configurable `AAVA_OUTBOUND_DIAL_CONTEXT`, `AAVA_OUTBOUND_DIAL_PREFIX`, `AAVA_OUTBOUND_CHANNEL_TECH`, and `AAVA_OUTBOUND_PBX_TYPE` (`freepbx`/`vicidial`/`generic`) for outbound campaign origination.
+- **GPU Host/Runtime Indicators**: Runtime GPU probe details in local AI server status with CUDA guard for STT/TTS backend selection and CPU fallback when GPU is unavailable.
+- **GPU-Aware Compatibility Checks**: Force rebuild flow for incompatible runtime/device combinations with `force_incompatible_apply` flag for intentional overrides.
+- **Local-Hybrid Wizard Persistence**: Setup wizard correctly persists `local_hybrid` pipeline, local STT/TTS backend selections, and model mappings through env and YAML config.
+- **Asterisk Config Discovery (Admin UI)**: New **System → Asterisk** page with live ARI connection status, required module checklist, configuration audit from preflight, and guided fix snippets. Dashboard pill shows Asterisk connection state (green/red) with click-through. Supports both local and remote Asterisk deployments.
+- **Preflight Asterisk Config Audit**: `preflight.sh` now audits `ari.conf`, `http.conf`, `extensions_custom.conf`, and 4 key Asterisk modules (`app_audiosocket`, `res_ari`, `res_stasis`, `chan_pjsip`), writing results to `data/asterisk_status.json` for the Admin UI.
+
+### Changed
+
+- **Tool Name Canonicalization**: `transfer` is now an alias for `blind_transfer`. `live_agent` and `transfer_to_live_agent` are aliases for `live_agent_transfer`. Tool allowlisting uses `canonicalize_tool_name()` for alias-aware matching across contexts.
+- **Admin UI Live Agent Section**: Status pills with real-time ARI checks, rebalanced row columns, destination override hidden behind Advanced toggle, internal extensions labeled as live agents.
+- **Admin UI Docker Compose GPU Overlay**: `start`/`recreate`/`rebuild` actions for `local_ai_server` now include `docker-compose.gpu.yml` when `GPU_AVAILABLE=true`.
+
+### Fixed
+
+- **`blind_transfer` Destination Resolution**: Fixed numeric target resolution and cross-provider naming (`transfer` vs `blind_transfer`) in tool allowlists.
+- **`live_agent_transfer` Fallback Routing**: Prevents mapping to non-live-agent destinations; falls back to explicit live-agent config or internal extensions.
+- **Streaming `provider_grace_ms` Cap**: Reverted then re-fixed the 60ms hardcoded cap on `provider_grace_ms` that degraded streaming latency.
+- **`check_extension_status` Opt-In**: Made the extension status tool opt-in; removed hardcoded transfer key examples from tool registry.
+- **Admin UI Log Troubleshooting**: Exclude per-frame audio noise from log views; add milestone tracking markers.
+- **Admin UI System API Indentation**: Fixed YAML indentation in system config API responses.
+- **Environment Drift Detection**: Ignore compose-injected `HEALTH_BIND_HOST` (only track `HEALTH_CHECK_*` prefix) to prevent perpetual "pending restart" drift in Env UI.
+- **Docker Image Metadata**: Handle missing Docker image metadata in containers API (`ImageNotFound` after prune/rebuild) without failing the endpoint.
+- **GPU Compose Overlay Preservation**: Preserve GPU compose overlay for `local_ai_server` UI actions (start, recreate, rebuild) so GPU device requests are not silently dropped.
+- **EnvPage GPU-Aware CUDA Options**: CUDA device option for Faster-Whisper and MeloTTS only shown when `GPU_AVAILABLE=true`.
+
+### Documentation
+
+- ViciDial Integration Guide (`docs/Vicidial-Setup.md`)
+- Fixed `transfer_call` references to canonical `transfer` / `blind_transfer` in ElevenLabs milestone docs
+- Updated 9 docs for `ai-agent.local.yaml` config override system and stash pop recovery procedures
+
+### Migration from v6.0.0
+
+1. **No breaking changes.** All new features are additive or opt-in.
+2. Existing `config/ai-agent.yaml` continues to work unchanged. The new `ai-agent.local.yaml` is optional.
+3. **Docker rebuild required**: Run `docker compose up -d --build --force-recreate` for all containers.
+4. **ViciDial users**: Set `AAVA_OUTBOUND_PBX_TYPE=vicidial` in `.env` and configure dial context/prefix as needed.
+
+## [6.0.0] - 2026-02-07
+
+### ⚠️ Breaking Changes
+
+- **OpenAI Realtime API version default changed to GA**: The default `api_version` is now `ga` (was `beta`). GA uses a nested audio schema (`audio.input.format` / `audio.output.format` with MIME types) instead of flat fields. Set `api_version: beta` explicitly to keep the old behavior.
+- **Email template autoescaping enabled**: `template_renderer.py` now uses `autoescape=True` by default. Custom HTML templates that rely on unescaped variable output may need to use Jinja2's `| safe` filter for intentionally raw HTML variables.
+
+### Added
+
+- **OpenAI Realtime GA API Support**: Full Beta-to-GA migration with `api_version` toggle (`ga` / `beta`). GA mode uses nested `audio.input.format` / `audio.output.format` with MIME types (`audio/pcm`, `audio/pcmu`, `audio/pcma`), `turn_detection` under `audio.input`, and `output_modalities` instead of `modalities`. Production-validated with `gpt-4o-realtime-preview-2024-12-17`.
+- **OpenAI Realtime `project_id`**: New config field and UI input for OpenAI project tracking via the `OpenAI-Project` header.
+- **OpenAI Realtime Voice Expansion**: 10 voices with gender labels (alloy, ash, ballad, cedar, coral, echo, marin, sage, shimmer, verse). Removed unsupported voices (nova, fable, onyx).
+- **Email System Overhaul**: New SMTP client (`smtp_client.py`) with rate limiting and deduplication, email dispatcher with provider abstraction (Resend / SMTP / auto-detect), HTML template engine with Jinja2 sandboxed rendering, per-context `from_email` / `admin_email` overrides, subject prefix, `call_outcome` and `hangup_initiator` template variables.
+- **Email Template Editor**: Admin UI modal for editing HTML email templates with defaults, preview, and per-tool configuration.
+- **SMTP Test Email**: Admin UI button to send a test email using current SMTP settings before saving.
+- **Google Live Hangup Fallback Watchdog**: Tunable timeout-based fallback for calls where Google Live does not emit `turnComplete`. Four new config fields: `hangup_fallback_audio_idle_sec`, `hangup_fallback_min_armed_sec`, `hangup_fallback_no_audio_timeout_sec`, `hangup_fallback_turn_complete_timeout_sec`.
+- **Google Live `toolConfig`**: Explicit tool configuration in setup message; fixed empty `required` arrays that caused 1008 disconnects.
+- **NAT / Advertise Host (Milestone 23)**: `AUDIOSOCKET_ADVERTISE_HOST` and `EXTERNAL_MEDIA_ADVERTISE_HOST` environment variables for split-horizon / NAT deployments where the advertised address differs from the bind address.
+- **GPU Acceleration Path**: `docker-compose.gpu.yml` overlay, `Dockerfile.gpu` with CUDA wheel build for llama-cpp-python, preflight GPU detection (`GPU_AVAILABLE` env var), and gated GPU layer configuration.
+- **Dashboard Live System Topology**: Clickable topology nodes navigate to settings pages (Providers → `/providers`, Pipelines → `/pipelines`, Models → `/models`, Asterisk/AI Engine → `/env`). Active model cards, pipeline path highlighting, platform info bar, compact resource strip.
+- **Admin UI Modernization**: Modern confirm dialogs (replaced all `alert()` / `confirm()`), toast notifications, `AlertDialog` component, SVG T-junction arrows, hover transitions, loading spinners.
+- **EnvPage Refactor**: Tab-based UI (AI Engine / Local AI / System) with comprehensive variable coverage, Docker Build Settings section for `INCLUDE_*` build-time flags.
+- **Help Section**: In-app documentation viewer with terminal-style rendering.
+- **Models Page Redesign**: Stacked full-width layout with active model cards showing real-time usage during calls.
+- **Env Drift Detection**: "Apply Changes" now detects `.env` drift vs running containers and recomputes the apply plan. SMTP/Resend env changes correctly trigger `ai_engine` restart.
+
+### Changed
+
+- **Hangup Tool Simplified (v5.0 design)**: Removed transcript-offer guardrails from `hangup_call` tool. The AI now manages transcript offers via system prompt instead of tool-level blocking. Simpler, fewer race conditions.
+- **UI `downstream_mode` options**: Replaced invalid `burst` option with valid `file` option to match backend schema.
+- **UI `response_modalities` serialization**: Now serializes as `List[str]` (e.g., `["audio"]`) instead of a comma-separated string.
+
+### Fixed
+
+- **Google Live Hangup Before `turnComplete`**: Fixed race where hangup could fire before the provider emitted `turnComplete`, causing stuck calls.
+- **Google Live Model Normalization**: Hardened model name normalization and provider options to prevent 1008 errors from malformed setup messages.
+- **OpenAI Realtime GA Schema Stabilization**: 15+ iterative fixes for GA session.update format — MIME types, nested format objects, rate fields, turn_detection placement, delta type handling, output format enforcement.
+- **OpenAI Realtime GA `response.create`**: Removed `output_modalities` and `input` array from GA response.create (rejected by API).
+- **OpenAI Realtime GA `delta` Handling**: Fixed crash where `response.output_audio.delta` sends `delta` as a base64 string, not a dict.
+- **Email Template Save**: Fixed template persistence and `call_outcome` variable availability.
+- **Request Transcript Email**: Fixed issue where `request_transcript` used the last email address instead of the one from the current request.
+- **UI No-Op Knobs Removed**: Removed `create_response` checkbox from OpenAI Realtime form (GA hardcodes `true`), removed `continuous_input` checkbox from Google Live form (no backend field).
+- **Test Alignment**: OpenAI Realtime provider test updated for GA payload shape; hangup tool tests aligned with v5.0 simplified design.
+
+### Security
+
+- **Email Template Autoescaping**: `SandboxedEnvironment(autoescape=True)` prevents HTML injection from user-controlled template variables (e.g., caller speech transcripts). Pre-escaped keys (`transcript_html`, `transcript`) use `Markup()` to avoid double-escaping.
+
+### Migration from v5.3.1
+
+1. **OpenAI Realtime users**: If you were using the default `api_version` (previously `beta`), the new default is `ga`. To keep beta behavior, explicitly set `providers.openai_realtime.api_version: beta` in your YAML config.
+2. **Email users**: SMTP support is new. Existing Resend-only setups continue to work unchanged. To use SMTP, add `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` to your `.env`.
+3. **Docker rebuild required**: Run `docker compose up -d --build --force-recreate` for all containers.
+4. **Run preflight**: Execute `./preflight.sh` to detect GPU availability and validate system state.
+
 ## [5.3.1] - 2026-02-01
 
 ### Added
@@ -1223,6 +1434,9 @@ Version 4.1 introduces **unified tool calling architecture** enabling AI agents 
 
 ## Version History
 
+- **v6.2.2** (2026-02-20) - Vertex AI credentials auto-management, ADC graceful fallback, secrets dir permissions, install.sh YAML dupe fix, dashboard pipeline variant display
+- **v6.2.1** (2026-02-20) - Google Vertex AI Live API Support, credential upload/verify/delete, preflight secrets dir check
+- **v6.2.0** (2026-02-20) - Google Live API integration, Admin UI provider settings, golden baseline configs
 - **v5.3.1** (2026-02-01) - Phase Tools (HTTP + webhooks) + Deepgram language + Admin UI + RCA enhancements + stability fixes
 - **v5.2.5** (2026-01-28) - Stable Updates improvements + updater image publishing + AudioSocket default
 - **v5.2.4** (2026-01-26) - Admin UI Docker Services hardening + remove background update checks
@@ -1239,7 +1453,12 @@ Version 4.1 introduces **unified tool calling architecture** enabling AI agents 
 - **v4.0.0** (2025-10-29) - Modular pipeline architecture, production monitoring, golden baselines
 - **v3.0.0** (2025-09-16) - Modular pipeline architecture, file based playback
 
-[Unreleased]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/compare/v5.3.1...HEAD
+[Unreleased]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/compare/v6.2.2...HEAD
+[6.2.2]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/compare/v6.2.1...v6.2.2
+[6.2.1]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/compare/v6.2.0...v6.2.1
+[6.2.0]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/compare/v6.1.1...v6.2.0
+[6.1.1]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/releases/tag/v6.1.1
+[6.0.0]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/releases/tag/v6.0.0
 [5.3.1]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/releases/tag/v5.3.1
 [5.2.5]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/releases/tag/v5.2.5
 [5.2.4]: https://github.com/hkjarral/Asterisk-AI-Voice-Agent/releases/tag/v5.2.4

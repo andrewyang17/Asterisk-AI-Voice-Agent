@@ -37,6 +37,8 @@ class GoogleToolAdapter:
         returning all registered tools automatically.
         
         Google format:
+        Note: legacy aliases like "transfer_call" are canonicalized to "blind_transfer"
+        by ToolRegistry before execution.
         [{
             "functionDeclarations": [
                 {
@@ -70,14 +72,18 @@ class GoogleToolAdapter:
                     parameters = schema
                 else:
                     # Built-in tools with ToolParameter list
+                    required_params = [p.name for p in definition.parameters if p.required]
                     parameters = {
                         "type": "object",
                         "properties": {
                             p.name: p.to_dict()
                             for p in definition.parameters
                         },
-                        "required": [p.name for p in definition.parameters if p.required]
                     }
+                    # Only include 'required' if there are required parameters
+                    # Empty required arrays can cause 1008 policy violations with Google Live API
+                    if required_params:
+                        parameters["required"] = required_params
                 
                 declaration = {
                     "name": tool_name,
@@ -129,14 +135,18 @@ class GoogleToolAdapter:
                 parameters = schema
             else:
                 # Built-in tools with ToolParameter list
+                required_params = [p.name for p in definition.parameters if p.required]
                 parameters = {
                     "type": "object",
                     "properties": {
                         p.name: p.to_dict()
                         for p in definition.parameters
                     },
-                    "required": [p.name for p in definition.parameters if p.required]
                 }
+                # Only include 'required' if there are required parameters
+                # Empty required arrays can cause 1008 policy violations with Google Live API
+                if required_params:
+                    parameters["required"] = required_params
             
             declaration = {
                 "name": tool_name,

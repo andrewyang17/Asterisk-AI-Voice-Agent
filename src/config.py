@@ -7,12 +7,12 @@ using Pydantic v2 for validation and type safety.
 
 import os
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Dict, Any, Optional, List
 import structlog
 
 # Import configuration helpers (AAVA-40 refactor)
-from src.config.loaders import resolve_config_path, load_yaml_with_env_expansion
+from src.config.loaders import resolve_config_path, load_yaml_with_env_expansion, load_yaml_with_local_override
 from src.config.security import (
     inject_asterisk_credentials,
     inject_llm_config,
@@ -169,11 +169,15 @@ class OpenAIProviderConfig(BaseModel):
     organization: Optional[str] = None
     project: Optional[str] = None
     tools_enabled: bool = Field(default=True)
+    # "ga" = GA Realtime API (no beta header, gpt-realtime models)
+    # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)
+    # Default to beta for widest account compatibility out-of-box.
+    api_version: str = Field(default="beta")
     realtime_base_url: str = Field(default="wss://api.openai.com/v1/realtime")
     chat_base_url: str = Field(default="https://api.openai.com/v1")
     stt_base_url: str = Field(default="https://api.openai.com/v1/audio/transcriptions")
     tts_base_url: str = Field(default="https://api.openai.com/v1/audio/speech")
-    realtime_model: str = Field(default="gpt-realtime")
+    realtime_model: str = Field(default="gpt-4o-realtime-preview-2024-12-17")
     chat_model: str = Field(default="gpt-4o-mini")
     stt_model: str = Field(default="whisper-1")
     # NOTE: Default to widely-available TTS model to avoid silent-call failures when
@@ -190,6 +194,31 @@ class OpenAIProviderConfig(BaseModel):
     response_timeout_sec: float = Field(default=5.0)
     # Provider-specific farewell hangup delay (overrides global)
     farewell_hangup_delay_sec: Optional[float] = None
+
+
+class TelnyxLLMProviderConfig(BaseModel):
+    """
+    Canonical defaults for the Telnyx AI Inference LLM adapter.
+
+    Notes:
+    - Telnyx-hosted models (e.g. meta-llama/*) work with TELNYX_API_KEY only.
+    - External models (e.g. openai/*) require an Integration Secret identifier
+      passed via `api_key_ref` (see Telnyx docs for "Integration Secrets").
+    """
+
+    model_config = ConfigDict(extra="ignore")
+
+    api_key: Optional[str] = None
+    api_key_ref: Optional[str] = None
+
+    chat_base_url: str = Field(default="https://api.telnyx.com/v2/ai")
+    # Default to a model that supports tool calling reliably on Telnyx.
+    chat_model: str = Field(default="Qwen/Qwen3-235B-A22B")
+
+    temperature: float = Field(default=0.7)
+    max_tokens: Optional[int] = None
+    # Telnyx-hosted models can be slower than OpenAI; keep a more forgiving default.
+    response_timeout_sec: float = Field(default=30.0)
 
 
 class GoogleProviderConfig(BaseModel):
@@ -237,6 +266,32 @@ class GoogleProviderConfig(BaseModel):
     )
     # Provider-specific farewell hangup delay (overrides global)
     farewell_hangup_delay_sec: Optional[float] = None
+    # Fallback watchdog tuning (Google Live only)
+    hangup_fallback_audio_idle_sec: float = Field(default=1.25)
+    hangup_fallback_min_armed_sec: float = Field(default=0.8)
+    hangup_fallback_no_audio_timeout_sec: float = Field(default=4.0)
+    # Guard against premature fallback hangup before the provider emits turnComplete.
+    # If turnComplete never arrives, fallback still proceeds after this timeout.
+    hangup_fallback_turn_complete_timeout_sec: float = Field(default=2.5)
+    # Google Live only: heuristic hangup detection based on transcript markers (end_call / assistant_farewell).
+    # For production, prefer tool-driven hangup (`hangup_call`) to avoid marker-driven premature cleanup.
+    hangup_markers_enabled: bool = Field(default=False)
+    # Google Live only: protocol-level WebSocket ping keepalive.
+    # NOTE: Google Live typically receives continuous `realtimeInput` audio frames; pings are only needed
+    # if the transport becomes idle. Some accounts/models appear to close connections (1008) after repeated
+    # ping frames, so we default to pinging only when idle (see provider implementation).
+    ws_keepalive_enabled: bool = Field(default=False)
+    ws_keepalive_interval_sec: float = Field(default=15.0)
+    ws_keepalive_idle_sec: float = Field(default=5.0)
+
+    # Google Vertex AI Live API support (AAVA-191)
+    # When use_vertex_ai=True, the provider connects to Vertex AI instead of the Developer API.
+    # Vertex AI uses OAuth2/ADC (Application Default Credentials) instead of an API key.
+    # Requires: GOOGLE_APPLICATION_CREDENTIALS or gcloud auth application-default login
+    # Vertex AI GA models fix the function calling 1008 bug present in Developer API preview models.
+    use_vertex_ai: bool = Field(default=False)
+    vertex_project: Optional[str] = None  # GCP project ID (GOOGLE_CLOUD_PROJECT)
+    vertex_location: str = Field(default="us-central1")  # GCP region (GOOGLE_CLOUD_LOCATION)
 
 
 class GroqSTTProviderConfig(BaseModel):
@@ -346,11 +401,16 @@ class MCPConfig(BaseModel):
 class OpenAIRealtimeProviderConfig(BaseModel):
     enabled: bool = Field(default=True)
     api_key: Optional[str] = None
-    model: str = Field(default="gpt-realtime")
+    # "ga" = GA Realtime API (no beta header, gpt-realtime models)
+    # "beta" = Beta Realtime API (OpenAI-Beta header, gpt-4o-realtime-preview models)
+    # Default to beta for widest account compatibility out-of-box.
+    api_version: str = Field(default="beta")
+    model: str = Field(default="gpt-4o-realtime-preview-2024-12-17")
     voice: str = Field(default="alloy")
     base_url: str = Field(default="wss://api.openai.com/v1/realtime")
     instructions: Optional[str] = None
     organization: Optional[str] = None
+    project_id: Optional[str] = None  # OpenAI project ID for usage tracking (OpenAI-Project header)
     input_encoding: str = Field(default="slin16")  # AudioSocket inbound default (8 kHz PCM16)
     input_sample_rate_hz: int = Field(default=8000)  # AudioSocket source sample rate
     provider_input_encoding: str = Field(default="linear16")  # Provider expects PCM16 LE
@@ -557,6 +617,8 @@ def _normalize_pipelines(config_data: Dict[str, Any]) -> None:
 
 
 class AppConfig(BaseModel):
+    # Config schema marker used by migration tooling and release docs.
+    config_version: int = Field(default=6, ge=1)
     default_provider: str
     providers: Dict[str, Any]
     asterisk: AsteriskConfig
@@ -648,9 +710,11 @@ def load_config(path: str = "config/ai-agent.yaml") -> AppConfig:
         
     Complexity: 5 (down from ~20)
     """
-    # Phase 1: Load YAML file with environment variable expansion
+    # Phase 1: Load YAML file with environment variable expansion and local overrides
     path = resolve_config_path(path)
-    config_data = load_yaml_with_env_expansion(path)
+    config_data = load_yaml_with_local_override(path)
+    if isinstance(config_data, dict):
+        config_data.setdefault("config_version", 6)
 
     # Backward compatibility: older docs/configs used `in_call_http_tools` at the top-level.
     # Canonical key is now `in_call_tools` (dict of tool_name -> config).
@@ -775,6 +839,14 @@ def validate_production_config(config: AppConfig) -> tuple[list[str], list[str]]
     
     # Critical checks (errors)
     try:
+        # Config version guidance (non-blocking): allows older configs but makes drift explicit.
+        config_version = getattr(config, "config_version", 6)
+        if config_version < 6:
+            warnings.append(
+                f"config_version={config_version} is older than the v6 baseline (6); "
+                "review release migration notes before production rollout"
+            )
+
         # VAD configuration consistency
         if hasattr(config, 'vad') and config.vad:
             if getattr(config.vad, 'enhanced_enabled', False):

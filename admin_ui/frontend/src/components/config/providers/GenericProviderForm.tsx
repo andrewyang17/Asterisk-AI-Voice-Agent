@@ -1,8 +1,10 @@
 import React, { useState, useEffect } from 'react';
+import { toast } from 'sonner';
 import { Plus, Trash2, AlertTriangle } from 'lucide-react';
 import HelpTooltip from '../../ui/HelpTooltip';
 import { FormInput, FormSelect, FormLabel, FormSwitch } from '../../ui/FormComponents';
 import { Capability, ensureModularKey, isRegisteredProvider, getUnregisteredReason, REGISTERED_PROVIDER_TYPES } from '../../../utils/providerNaming';
+import { GOOGLE_LIVE_MODEL_OPTIONS } from '../../../utils/googleLiveModels';
 
 interface GenericProviderFormProps {
     config: any;
@@ -21,6 +23,8 @@ const CAPABILITIES: { value: Capability; label: string }[] = [
     { value: 'llm', label: 'Large Language Model (LLM)' },
     { value: 'tts', label: 'Text-to-Speech (TTS)' },
 ];
+
+const GOOGLE_LIVE_SUGGESTED_MODELS = GOOGLE_LIVE_MODEL_OPTIONS.map((modelOption) => modelOption.value);
 
 const PROVIDER_OPTIONS: Record<string, Record<string, string[]>> = {
     deepgram: {
@@ -56,8 +60,8 @@ const PROVIDER_OPTIONS: Record<string, Record<string, string[]>> = {
         voice: ['alloy', 'echo', 'shimmer', 'ash', 'ballad', 'coral', 'sage', 'verse'],
     },
     google_live: {
-        model: ['gemini-2.0-flash-exp', 'gemini-1.5-pro', 'gemini-1.5-flash'],
-        llm_model: ['gemini-2.0-flash-exp', 'gemini-1.5-pro', 'gemini-1.5-flash'],
+        model: GOOGLE_LIVE_SUGGESTED_MODELS,
+        llm_model: GOOGLE_LIVE_SUGGESTED_MODELS,
         tts_voice_name: ['Puck', 'Charon', 'Kore', 'Fenrir', 'Aoede', 'Leda', 'Orus', 'Zephyr'],
     },
 };
@@ -153,12 +157,12 @@ const GenericProviderForm: React.FC<GenericProviderFormProps> = ({ config, onCha
     const handleCapabilityChange = (cap: Capability) => {
         // If editing existing modular provider, do not allow capability change
         if (!isNew && config.capabilities && config.capabilities.length === 1 && config.type !== 'full') {
-            alert('Modular capability cannot be changed after save. Please delete and recreate the provider with the desired capability.');
+            toast.error('Modular capability cannot be changed after save. Please delete and recreate the provider with the desired capability.');
             return;
         }
         // Require a base name before selecting capability
         if (!config.name || config.name.trim() === '') {
-            alert('Please enter a provider name before selecting a capability.');
+            toast.error('Please enter a provider name before selecting a capability.');
             return;
         }
         const updates: any = { capabilities: [cap] };

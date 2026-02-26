@@ -580,7 +580,9 @@ class StreamingPlaybackManager:
             # Set TTS gating before starting stream
             # Skip gating for full agent providers that handle turn-taking internally
             # These providers have server-side VAD and don't need client-side audio gating
-            FULL_AGENT_PROVIDERS = {'deepgram', 'openai_realtime', 'elevenlabs_agent', 'google_live'}
+            # NOTE: google_live is intentionally EXCLUDED — it lacks server-side echo cancellation,
+            # so engine-side gating is required to prevent echoed model audio from confusing its VAD.
+            FULL_AGENT_PROVIDERS = {'deepgram', 'openai_realtime', 'elevenlabs_agent'}
             provider_name = getattr(session, 'provider_name', None) if session else None
             skip_gating = provider_name in FULL_AGENT_PROVIDERS
             
@@ -645,12 +647,20 @@ class StreamingPlaybackManager:
             transport_format = self.audiosocket_format
             if self.audio_transport == "externalmedia":
                 session = await self.session_store.get_by_call_id(call_id)
-                if session and hasattr(session, 'external_media_codec'):
+                if session and hasattr(session, 'external_media_codec') and session.external_media_codec:
                     transport_format = session.external_media_codec
                     logger.debug(
                         "Using ExternalMedia codec for target format",
                         call_id=call_id,
                         codec=transport_format
+                    )
+                else:
+                    # Greeting may fire before ExternalMedia codec is stored;
+                    # default to ulaw which is the standard ExternalMedia codec.
+                    transport_format = "ulaw"
+                    logger.debug(
+                        "ExternalMedia codec not yet available, defaulting to ulaw",
+                        call_id=call_id,
                     )
             
             mulaw_transport = self._is_mulaw(transport_format)
@@ -1270,13 +1280,21 @@ class StreamingPlaybackManager:
             cfg_wait = max(0.0, float(self.provider_grace_ms) / 1000.0)
         except Exception:
             cfg_wait = 0.5
-        if cfg_wait > 0.06 and not bool(stream_info.get('warned_grace_cap', False)):
+        # Avoid pathological "wait forever" configs, but don't hard-cap so low that
+        # bursty providers (e.g., Google Live) constantly drain the buffer and stutter.
+        max_wait_cap_sec = 2.0
+        if cfg_wait > max_wait_cap_sec and not bool(stream_info.get('warned_grace_cap', False)):
             try:
-                logger.warning("provider_grace_ms capped", call_id=call_id, configured_ms=int(self.provider_grace_ms), cap_ms=60)
+                logger.warning(
+                    "provider_grace_ms clamped",
+                    call_id=call_id,
+                    configured_ms=int(self.provider_grace_ms),
+                    clamp_ms=int(max_wait_cap_sec * 1000),
+                )
             except Exception:
                 pass
             stream_info['warned_grace_cap'] = True
-        max_wait = min(0.06, cfg_wait)
+        max_wait = min(max_wait_cap_sec, cfg_wait)
         if max_wait <= 0.0:
             stream_info.pop('low_water_deadline', None)
             return False

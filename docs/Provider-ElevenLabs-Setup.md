@@ -6,7 +6,7 @@ ElevenLabs Conversational AI is a full-agent provider that combines speech-to-te
 
 **Performance**: 1-2 second response latency | Full duplex | Client-side tool execution
 
-> **Note**: ElevenLabs is a **full agent only** provider. TTS-only mode for hybrid pipelines is not currently supported.
+> **Note**: This guide covers **both** the **full-agent** provider (`elevenlabs_agent`) and the **TTS-only pipeline adapter** (`elevenlabs_tts`) for modular pipelines. See [ElevenLabs TTS Pipeline Adapter](#elevenlabs-tts-pipeline-adapter) for modular setup.
 
 If you used the Admin UI Setup Wizard, you may not need to follow this guide end-to-end. For first-call onboarding and transport selection, see:
 - `INSTALLATION.md`
@@ -69,18 +69,32 @@ The ElevenLabs provider is configured in `config/ai-agent.yaml`:
 providers:
   elevenlabs_agent:
     enabled: true
-    # API credentials loaded from environment variables
-    # api_key: ${ELEVENLABS_API_KEY}  # Read from env
-    # agent_id: ${ELEVENLABS_AGENT_ID}  # Read from env
+    type: full
+    capabilities: ["stt", "llm", "tts"]
+
+    # Credentials are loaded from environment variables (env-only):
+    # - ELEVENLABS_API_KEY
+    # - ELEVENLABS_AGENT_ID
     
-    # Audio Configuration (fixed for ElevenLabs)
-    input_sample_rate: 16000
-    output_sample_rate: 16000
+    # Transport/provider audio formats
+    input_encoding: ulaw
+    input_sample_rate_hz: 8000
+    provider_input_encoding: pcm16
+    provider_input_sample_rate_hz: 16000
+    output_encoding: pcm16
+    output_sample_rate_hz: 16000
+    target_encoding: ulaw
+    target_sample_rate_hz: 8000
+
+    # Voice/model (examples; use values from your ElevenLabs account)
+    voice_id: uDsPstFWFBUXjIBimV7s
+    model_id: eleven_flash_v2_5
 ```
 
 **Key Settings**:
-- Audio format is fixed at PCM16 @ 16kHz (engine handles resampling from telephony)
-- Voice and LLM model are configured in the ElevenLabs dashboard
+- Telephony ingress is typically μ-law @ 8 kHz; the engine handles resampling to ElevenLabs’ native PCM16
+- `ELEVENLABS_AGENT_ID` is required (used to fetch a signed URL)
+- Voice/model can be configured in YAML (voice/model IDs) and in the ElevenLabs dashboard (agent behavior)
 - Greeting and prompt can be overridden from context YAML (see Dynamic Variables section)
 
 ### 6. Configure Asterisk Dialplan
@@ -172,12 +186,12 @@ ElevenLabs uses **Client Tools** - tools defined in the dashboard but executed b
 
 > **Important**: The description must be imperative - simply saying "goodbye" does NOT end the call. The LLM must invoke this tool.
 
-### transfer_call
+### transfer
 
 ```json
 {
   "type": "client",
-  "name": "transfer_call",
+  "name": "transfer",
   "description": "Transfer the caller to another extension or department. Use when the caller asks to speak with a live person, agent, or specific department like sales or support.",
   "disable_interruptions": false,
   "force_pre_tool_speech": "auto",
@@ -344,7 +358,7 @@ contexts:
 
 **Context fields override ElevenLabs dashboard settings** when the corresponding toggles are enabled in Security → Overrides.
 
-> **Tool Names**: The context `tools:` list uses canonical names (`transfer`) for compatibility with other providers (Deepgram, OpenAI). ElevenLabs dashboard uses `transfer_call` - the system handles this mapping via `TOOL_ALIASES`.
+> **Tool Names**: Use standard names (`transfer`, `hangup_call`, etc.) in both the context `tools:` list and the ElevenLabs dashboard. Note: `transfer` is an alias of canonical `blind_transfer`.
 
 ## Dynamic Variables & Overrides
 
@@ -463,7 +477,7 @@ When the caller indicates they're done (goodbye, thanks, that's all, etc.):
 
 **Fix**:
 1. Verify tool schemas are added in ElevenLabs Agent → Tools tab
-2. Ensure tool names match exactly: `hangup_call`, `transfer_call`, `leave_voicemail`, `cancel_transfer`, `request_transcript`
+2. Ensure tool names match exactly: `hangup_call`, `transfer`, `leave_voicemail`, `cancel_transfer`, `request_transcript`
 3. Check tools are linked to your agent ("Dependent agents")
 4. Check logs for `client_tool_call` events
 
@@ -503,6 +517,127 @@ When the caller indicates they're done (goodbye, thanks, that's all, etc.):
 - ElevenLabs offers premium voice quality
 - Test different voices for your use case
 - Adjust voice settings (stability, similarity) in dashboard
+
+## ElevenLabs TTS Pipeline Adapter
+
+In addition to the full-agent provider, ElevenLabs can be used as a **TTS-only component** in modular pipelines (e.g., `local_stt` → `openai_llm` → `elevenlabs_tts`). This gives you premium ElevenLabs voice quality while choosing your own STT and LLM providers.
+
+### Prerequisites
+
+- `ELEVENLABS_API_KEY` in your `.env` file (same key used for the full agent)
+- No `ELEVENLABS_AGENT_ID` needed — this uses the TTS API directly
+
+### Provider Configuration
+
+A default `elevenlabs_tts` provider is included in `config/ai-agent.golden-elevenlabs.yaml`. To use it, add the provider to your `config/ai-agent.yaml` under `providers:`:
+
+```yaml
+providers:
+  elevenlabs_tts:
+    type: elevenlabs
+    enabled: true
+    capabilities:
+      - tts
+    voice_id: "21m00Tcm4TlvDq8ikWAM"   # Rachel (warm, professional)
+    model_id: "eleven_turbo_v2_5"        # Fast, high-quality
+    output_format: "ulaw_8000"           # Telephony-optimized
+    stability: 0.5
+    similarity_boost: 0.75
+    style: 0.0
+    use_speaker_boost: true
+```
+
+**Key settings**:
+- **`voice_id`**: Choose from the [ElevenLabs Voice Library](https://elevenlabs.io/voice-library). Default is Rachel (`21m00Tcm4TlvDq8ikWAM`).
+- **`model_id`**: `eleven_turbo_v2_5` offers the best balance of speed and quality for telephony.
+- **`output_format`**: Must be `ulaw_8000` for telephony. ElevenLabs returns μ-law encoded audio at 8 kHz.
+
+### Pipeline Configuration
+
+Reference `elevenlabs_tts` as the TTS component in your pipeline:
+
+```yaml
+pipelines:
+  local_hybrid:
+    stt: local_stt
+    llm: openai_llm
+    tts: elevenlabs_tts    # ElevenLabs for premium voice quality
+    options:
+      stt:
+        mode: stt
+        streaming: true
+        stream_format: pcm16_16k
+      llm:
+        model: gpt-4o-mini
+        temperature: 0.7
+        max_tokens: 150
+      tts:
+        format:
+          encoding: mulaw
+          sample_rate: 8000
+```
+
+### Audio Profile
+
+The recommended audio profile for ElevenLabs TTS pipelines is **`telephony_ulaw_8k`**:
+
+```yaml
+contexts:
+  demo_hybrid:
+    pipeline: local_hybrid
+    profile: telephony_ulaw_8k    # Required for ElevenLabs TTS
+    greeting: "Hi, I'm Ava. How can I help you today?"
+    prompt: "You are a helpful AI assistant."
+```
+
+### Transport Compatibility
+
+| Transport | Status | Notes |
+|-----------|--------|-------|
+| **AudioSocket** | ✅ Validated | Streaming playback via AudioSocket |
+| **ExternalMedia RTP** | ✅ Validated | Streaming playback via RTP |
+
+Both transports are supported. The engine automatically handles format conversion between ElevenLabs μ-law output and the transport wire format.
+
+### Barge-In Tuning for Speakerphone
+
+When callers use **speakerphone**, the agent's own TTS audio can feed back through the caller's microphone, causing false barge-in interruptions that cut off the agent mid-sentence.
+
+**Recommended barge-in settings for ElevenLabs TTS pipelines:**
+
+```yaml
+barge_in:
+  enabled: true
+  energy_threshold: 1000         # Higher than default (700) to ignore echo
+  min_ms: 250                    # Minimum speech duration to trigger
+  cooldown_ms: 500               # Cooldown between barge-in events
+  post_tts_end_protection_ms: 600  # Prevents false triggers after TTS ends
+  provider_output_suppress_ms: 1200
+```
+
+The critical setting is **`post_tts_end_protection_ms: 600`** (default is 250). This prevents the system from interpreting speakerphone echo as a barge-in attempt immediately after each TTS segment finishes. You can configure this in the Admin UI under **Barge-in → Post-TTS Protection (ms)**.
+
+> **Tip**: If you still experience greeting cutoff on speakerphone, try increasing `initial_protection_ms` to 500-1000ms. This protects the beginning of each TTS utterance.
+
+### Troubleshooting (Pipeline TTS)
+
+**Issue: "Pipeline TTS validation FAILED — No base_url/ws_url configured"**
+
+Cause: The `elevenlabs_tts` provider was created through the Admin UI with empty fields.
+
+Fix: Use the YAML configuration above instead, or ensure the Admin UI provider has `type: elevenlabs` and `capabilities: [tts]` set correctly. The engine auto-discovers the ElevenLabs API base URL.
+
+**Issue: "Pipeline is invalid — cannot resolve tts component 'elevenlabs_tts'"**
+
+Cause: Provider name typo or missing provider configuration.
+
+Fix: Verify `elevenlabs_tts` is defined under `providers:` in your config and `ELEVENLABS_API_KEY` is set in `.env`.
+
+**Issue: Audio sounds garbled or too fast**
+
+Cause: Audio profile mismatch.
+
+Fix: Ensure your context uses `profile: telephony_ulaw_8k` and the provider has `output_format: ulaw_8000`.
 
 ## See Also
 

@@ -2,6 +2,17 @@
 
 This document explains every major option in `config/ai-agent.yaml`, the precedence model for greeting/persona, and the impact of fine‑tuning parameters across AudioSocket/ExternalMedia, VAD, Barge‑In, Streaming, and Providers.
 
+## Local Override File (`ai-agent.local.yaml`)
+
+Operator customizations are stored in `config/ai-agent.local.yaml` (git-ignored). At startup the engine deep-merges this file on top of the base `config/ai-agent.yaml`:
+
+- **Base file** (`config/ai-agent.yaml`) — shipped golden defaults, git-tracked. Updated by upstream releases.
+- **Local override** (`config/ai-agent.local.yaml`) — operator changes only. All Admin UI saves, CLI wizard writes, and `agent setup` output go here.
+
+Keys in the local file win over the base file (deep merge — nested dicts are merged recursively, scalars are replaced). If the local file does not exist, the base file is used as-is.
+
+This separation means `git pull` during updates will never conflict with operator config, eliminating the merge-conflict problem on `ai-agent.yaml`.
+
 ## Configuration Architecture (v5.0)
 
 Starting in v4.0, the project added a **modular pipeline architecture** alongside monolithic provider support:
@@ -17,6 +28,14 @@ Starting in v4.0, the project added a **modular pipeline architecture** alongsid
 - Examples: Local Hybrid (Vosk STT + OpenAI LLM + Piper TTS)
 - Configuration: Define under `pipelines:` block and set `active_pipeline: "pipeline_name"`
 - **Best for**: Flexibility, privacy (local audio processing), cost control
+
+### Pipeline LLM Hangup Guardrail (hangup_call)
+
+Some pipeline LLMs can be overly eager to emit `hangup_call`. A per-pipeline guardrail can require explicit end-of-call intent in the user's transcript before honoring `hangup_call`.
+
+- `pipelines.<name>.options.llm.hangup_call_guardrail`: `true`/`false` (unset = auto; enabled by default for specific adapters)
+- `pipelines.<name>.options.llm.hangup_call_guardrail_mode`: `relaxed`/`normal`/`strict` (unset = use global hangup policy mode)
+- `pipelines.<name>.options.llm.hangup_call_guardrail_markers.end_call`: list of caller phrases that count as end-of-call intent (unset/empty = use global hangup policy defaults)
 
 ### Golden Baselines
 See the 5 validated configurations in `config/`:
@@ -34,7 +53,7 @@ Environment variables for selecting local STT/TTS backends:
 
 | Variable | Options | Default | Description |
 |----------|---------|---------|-------------|
-| `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `faster_whisper`, `whisper_cpp` | `vosk` | Speech-to-text engine |
+| `LOCAL_STT_BACKEND` | `vosk`, `sherpa`, `kroko`, `faster_whisper` | `vosk` | Speech-to-text engine |
 | `LOCAL_TTS_BACKEND` | `piper`, `kokoro`, `melotts` | `piper` | Text-to-speech engine |
 
 **STT Backends**:
@@ -42,7 +61,6 @@ Environment variables for selecting local STT/TTS backends:
 - **Sherpa-ONNX**: Low-latency streaming ASR using ONNX runtime
 - **Kroko**: High-quality streaming ASR with 12+ languages (requires API key for hosted mode)
 - **Faster-Whisper**: Whisper inference via `faster-whisper` (model IDs like `base`, `small`, etc., or a local model directory depending on your install)
-- **Whisper.cpp**: Whisper inference via `whisper.cpp` (if built into your local-ai-server image)
 
 **TTS Backends**:
 - **Piper**: Fast local TTS with multiple voices
@@ -68,6 +86,16 @@ This selection is intentionally flexible so you can keep safe defaults while sti
 
 - If your dialplan sets `AI_CONTEXT`, that context name is used.
 - Otherwise, the engine uses the `default` context.
+
+### Audio profile selection
+
+Audio profiles control the call’s negotiated sample rates/encodings (telephony wire format, provider input/output format, and internal pacing). They are defined under `profiles:` in `config/ai-agent.yaml`.
+
+Highest priority first:
+
+1. **Dialplan override**: `AI_AUDIO_PROFILE` (if set)
+2. **Context mapping**: `contexts.<name>.profile` (if set for the selected context)
+3. **Global default**: `profiles.default` (fallback is `telephony_ulaw_8k` if unset)
 
 ### Provider selection
 
@@ -240,21 +268,21 @@ Common pitfalls:
 
 - llm.initial_greeting: First message spoken by the agent (if provider supports explicit greeting or engine plays via TTS).
 - llm.prompt: Persona/system instruction used by LLMs.
-- llm.model: Baseline LLM name (used by some monolithic providers and Deepgram agent think stage).
 - llm.api_key: Optional API key for LLMs that require it.
 
 ## Providers
 
 ### OpenAI Realtime (monolithic agent)
 
-- providers.openai_realtime.api_key: Bearer auth.
+- providers.openai_realtime.api_key: injected from `OPENAI_API_KEY` (env-only; do not commit secrets to YAML).
+- providers.openai_realtime.api_version: `ga` (default) or `beta` (legacy payload/header behavior).
 - providers.openai_realtime.model, voice, base_url: Model and voice.
 - providers.openai_realtime.instructions: Persona override. Leave empty to inherit `llm.prompt`.
 - providers.openai_realtime.greeting: Explicit greeting. Leave empty to inherit `llm.initial_greeting`.
-- providers.openai_realtime.response_modalities: `audio`, `text`.
+- providers.openai_realtime.response_modalities: list of modalities, typically `[\"audio\"]` or `[\"audio\", \"text\"]`.
 - providers.openai_realtime.provider_input_encoding/provider_input_sample_rate_hz: Format sent to OpenAI (typically PCM16); prefer matching this to the engine’s internal PCM rate to avoid extra resampling.
 - providers.openai_realtime.input_encoding/input_sample_rate_hz: Inbound format; use `ulaw` at 8 kHz when AudioSocket() is invoked with `,ulaw` (engine converts to PCM before sending to OpenAI).
-- providers.openai_realtime.output_encoding/output_sample_rate_hz: Provider output; for telephony, prefer `mulaw` at 8 kHz (`output_audio_format=g711_ulaw`) to avoid mid-stream 24 kHz PCM → 8 kHz μ-law conversion artifacts.
+- providers.openai_realtime.output_encoding/output_sample_rate_hz: Provider output; for telephony, prefer `mulaw` at 8 kHz (for example: `output_encoding: mulaw`, `output_sample_rate_hz: 8000`) to avoid mid-stream PCM → μ-law conversion artifacts.
 - providers.openai_realtime.target_encoding/target_sample_rate_hz: Downstream transport expectations (e.g., μ‑law at 8 kHz).
 - providers.openai_realtime.egress_pacer_enabled: When true, OpenAI provider emits fixed 20 ms audio cadence (silence on underrun); prefer `false` when downstream playback already paces reliably.
 - providers.openai_realtime.turn_detection: Server‑side VAD (type, silence_duration_ms, threshold, prefix_padding_ms); improves turn handling.
@@ -270,11 +298,28 @@ Modular OpenAI pipeline components use `type: openai` provider blocks:
 
 Requirements:
 
-- `OPENAI_API_KEY` must be set in the environment (or referenced via `${OPENAI_API_KEY}`).
+- `OPENAI_API_KEY` must be set in the environment.
+
+### Telnyx AI Inference (pipelines)
+
+Telnyx AI Inference is supported as a modular LLM component:
+
+- `telnyx_llm`: OpenAI-compatible Chat Completions (`chat_base_url`, `chat_model`, `temperature`, `max_tokens`, `response_timeout_sec`, `api_key_ref`)
+
+Requirements:
+
+- `TELNYX_API_KEY` must be set in the environment.
+
+Notes:
+
+- Telnyx supports many model IDs. Use the exact model ID returned by Telnyx `/models`.
+- Some model IDs represent **external providers** (for example `openai/gpt-4o`). Those require `providers.telnyx_llm.api_key_ref` to be set (Integration Secret identifier) or Telnyx will return `400` with "OpenAI API key required…".
+- For pipeline selection, set `AI_PROVIDER=telnyx_hybrid` (pipeline name) in your dialplan when forcing a per-extension pipeline.
 
 ### Deepgram Voice Agent
 
-- providers.deepgram.api_key, model, tts_model.
+- providers.deepgram.api_key: injected from `DEEPGRAM_API_KEY` (env-only; do not commit secrets to YAML).
+- providers.deepgram.model, providers.deepgram.tts_model: Deepgram Voice Agent + Aura TTS models.
 - `providers.deepgram.agent_language`: Language for Deepgram Voice Agent mode (default: `en`).
 - providers.deepgram.greeting: Agent greeting. Leave empty to inherit `llm.initial_greeting`.
 - providers.deepgram.instructions: Persona override for the “think” stage; leave empty to inherit `llm.prompt`.
@@ -310,11 +355,18 @@ Config notes:
 
 ### Google Live (monolithic agent)
 
-- `providers.google_live.api_key`: API key (`GOOGLE_API_KEY`) used for Gemini Live.
-- `providers.google_live.llm_model`: Live LLM model name (e.g., `gemini-2.0-flash-live-001-preview-09-2025`).
-- `providers.google_live.websocket_endpoint`: WebSocket endpoint for Gemini Live API.
-  - Default: `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent`
-  - Override only if directed by Google or when fronting through a proxy.
+- `providers.google_live.api_key`: injected from `GOOGLE_API_KEY` (env-only; do not commit secrets to YAML).
+- `providers.google_live.llm_model`: Live LLM model name (see `config/ai-agent.yaml` for shipped defaults).
+- `providers.google_live.tts_voice_name`: Live voice name (provider-specific).
+- `providers.google_live.response_modalities`: `audio`, `text`, or `audio_text` (provider behavior varies by model generation).
+- `providers.google_live.hangup_fallback_audio_idle_sec`: idle-audio timeout after hangup is armed.
+- `providers.google_live.hangup_fallback_min_armed_sec`: minimum armed duration before fallback can fire.
+- `providers.google_live.hangup_fallback_no_audio_timeout_sec`: timeout when provider emits no farewell audio.
+- `providers.google_live.hangup_fallback_turn_complete_timeout_sec`: grace period waiting for `turnComplete` before fallback hangup.
+- `providers.google_live.hangup_markers_enabled`: enable/disable marker-based hangup heuristics (end_call / assistant_farewell) used to arm `cleanup_after_tts`. Recommended `false` for production (prefer tool-driven hangup via `hangup_call`).
+- `providers.google_live.ws_keepalive_enabled`: enable protocol-level WebSocket ping keepalive (pings only fire when the connection is idle).
+- `providers.google_live.ws_keepalive_interval_sec`: ping interval when keepalive is enabled.
+- `providers.google_live.ws_keepalive_idle_sec`: minimum idle time (no `realtimeInput`) before sending a ping.
 
 ### Deepgram Voice Agent (monolithic agent)
 
@@ -326,15 +378,13 @@ Config notes:
 
 Full agent provider using ElevenLabs Conversational AI for premium voice quality.
 
-> **Scope Note**: ElevenLabs is supported as a **full agent only** (STT+LLM+TTS combined). TTS-only mode for hybrid pipelines is not currently supported. Use ElevenLabs when you want premium voice quality with their hosted agent handling the entire conversation.
+> **Scope Note**: ElevenLabs is supported as a full agent (`elevenlabs_agent`) and as a TTS-only pipeline adapter (`elevenlabs_tts`).
 
-- `providers.elevenlabs_agent.api_key`: ElevenLabs API key (or use `ELEVENLABS_API_KEY` env var).
-- `providers.elevenlabs_agent.agent_id`: ElevenLabs Agent ID from [ElevenLabs dashboard](https://elevenlabs.io/app/agents) (or use `ELEVENLABS_AGENT_ID` env var).
+- `providers.elevenlabs_agent.api_key`: injected from `ELEVENLABS_API_KEY` (env-only; do not commit secrets to YAML).
+- `providers.elevenlabs_agent.agent_id`: injected from `ELEVENLABS_AGENT_ID` (env-only).
 - `providers.elevenlabs_agent.voice_id`: Voice ID for TTS output (configured in agent dashboard).
 - `providers.elevenlabs_agent.model_id`: Model ID (e.g., `eleven_flash_v2_5`).
 - `providers.elevenlabs_agent.voice_settings`: Optional object with `stability`, `similarity_boost`, `style` (0.0-1.0).
-- `providers.elevenlabs_agent.input_sample_rate`: Input audio sample rate (default: `16000`).
-- `providers.elevenlabs_agent.output_sample_rate`: Output audio sample rate (default: `16000`).
 
 **Tool Calling**: ElevenLabs tools must be defined in the ElevenLabs dashboard. The engine executes tool calls locally based on matching function names. See [ElevenLabs Implementation Guide](contributing/references/Provider-ElevenLabs-Implementation.md) for tool schema format.
 
@@ -345,8 +395,6 @@ Example:
 providers:
   elevenlabs_agent:
     enabled: true
-    api_key: ${ELEVENLABS_API_KEY}
-    agent_id: ${ELEVENLABS_AGENT_ID}
     voice_id: "pNInz6obpgDQGcFmaJgB"
     model_id: "eleven_flash_v2_5"
 ```

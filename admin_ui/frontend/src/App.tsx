@@ -1,5 +1,7 @@
 import React, { useEffect, useState, Suspense, lazy } from 'react';
 import { BrowserRouter as Router, Routes, Route, Navigate, useNavigate, useLocation } from 'react-router-dom';
+import { Toaster } from 'sonner';
+import { ConfirmDialogProvider } from './hooks/useConfirmDialog';
 import AppShell from './components/layout/AppShell';
 import Dashboard from './pages/Dashboard';
 import CallHistoryPage from './pages/CallHistoryPage';
@@ -40,6 +42,7 @@ const LogsPage = lazy(() => import('./pages/System/LogsPage'));
 const TerminalPage = lazy(() => import('./pages/System/TerminalPage'));
 const ModelsPage = lazy(() => import('./pages/System/ModelsPage'));
 const UpdatesPage = lazy(() => import('./pages/System/UpdatesPage'));
+const AsteriskPage = lazy(() => import('./pages/System/AsteriskPage'));
 
 // Loading fallback for lazy-loaded pages
 const PageLoader = () => (
@@ -116,6 +119,8 @@ const SetupGuard = ({ children }: { children: React.ReactNode }) => {
 function App() {
     return (
         <AuthProvider>
+            <ConfirmDialogProvider>
+            <Toaster position="top-right" richColors closeButton />
             <Router>
                 <Routes>
                     <Route path="/login" element={<LoginPage />} />
@@ -153,6 +158,7 @@ function App() {
                                             {/* System Management */}
                                             <Route path="/env" element={<EnvPage />} />
                                             <Route path="/docker" element={<DockerPage />} />
+                                            <Route path="/asterisk" element={<AsteriskPage />} />
                                             <Route path="/logs" element={<LogsPage />} />
                                             <Route path="/terminal" element={<TerminalPage />} />
                                             <Route path="/models" element={<ModelsPage />} />
@@ -171,6 +177,7 @@ function App() {
                     } />
                 </Routes>
             </Router>
+            </ConfirmDialogProvider>
         </AuthProvider>
     );
 }
